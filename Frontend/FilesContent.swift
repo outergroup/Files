@@ -1,0 +1,1627 @@
+import AppKit
+import Darwin
+import Foundation
+import QuartzCore
+import UniformTypeIdentifiers
+
+@MainActor
+@objc public final class FilesContent: NSObject, OuterframeContentLibrary {
+    @objc public static func start(
+        socketFD: Int32,
+        appConnection: OuterframeAppConnection
+    ) -> Int32 {
+        let outerframeHost = OuterframeHost(socketFD: socketFD)
+        let handler = FilesHandler(outerframeHost: outerframeHost, appConnection: appConnection)
+        outerframeHost.delegate = handler
+        return 0
+    }
+}
+
+private struct FileListResponse: Decodable, Sendable {
+    let path: String
+    let parent: String?
+    let entries: [FileEntry]
+}
+
+private struct FileEntry: Decodable, Sendable {
+    let name: String
+    let path: String
+    let isDirectory: Bool
+    let size: UInt64
+    let modified: Double
+    let mode: String
+}
+
+private struct BreadcrumbSegment {
+    let title: String
+    let path: String
+}
+
+private struct FavoriteLocation: Sendable {
+    let title: String
+    let path: String
+}
+
+private struct DroppedFileAccessPayload: Sendable {
+    let id: UUID
+    let name: String
+    let localPath: String
+    let fileSize: UInt64?
+    let fileType: String?
+    let isDirectory: Bool
+}
+
+private struct DroppedLocalFile: Sendable {
+    let id: UUID
+    let fileURL: URL
+    let name: String
+    let fileSize: UInt64?
+    let fileType: String?
+    let isDirectory: Bool
+}
+
+private enum OuterframePasteboardPayload {
+    private static let version: UInt32 = 1
+    private static let droppedFileAccessMissingSize = UInt64.max
+    private static let droppedFileAccessDirectoryFlag: UInt32 = 1 << 0
+
+    static func decodeDroppedFileAccess(_ data: Data) -> DroppedFileAccessPayload? {
+        var cursor = BinaryPayloadCursor(data)
+        guard cursor.readUInt32() == version,
+              let flags = cursor.readUInt32(),
+              let id = cursor.readUUID(),
+              let encodedFileSize = cursor.readUInt64(),
+              let name = cursor.readStringReference(),
+              !name.isEmpty,
+              let fileType = cursor.readStringReference(),
+              let localPath = cursor.readStringReference(),
+              !localPath.isEmpty else {
+            return nil
+        }
+
+        return DroppedFileAccessPayload(id: id,
+                                        name: name,
+                                        localPath: localPath,
+                                        fileSize: encodedFileSize == droppedFileAccessMissingSize ? nil : encodedFileSize,
+                                        fileType: fileType.isEmpty ? nil : fileType,
+                                        isDirectory: flags & droppedFileAccessDirectoryFlag != 0)
+    }
+}
+
+private struct BinaryPayloadBuilder {
+    private struct Reference {
+        let patchOffset: Int
+        let variableOffset: Int
+        let length: Int
+    }
+
+    private var fixed = Data()
+    private var variable = Data()
+    private var references: [Reference] = []
+    private let referenceBaseOffset: Int
+
+    init(referenceBaseOffset: Int) {
+        self.referenceBaseOffset = referenceBaseOffset
+    }
+
+    mutating func append(uint32 value: UInt32) {
+        fixed.appendLittleEndian(value)
+    }
+
+    mutating func append(stringReference string: String) -> Bool {
+        guard let data = string.data(using: .utf8),
+              data.count <= Int(UInt32.max) else {
+            return false
+        }
+        let patchOffset = fixed.count
+        fixed.appendLittleEndian(UInt32(0))
+        fixed.appendLittleEndian(UInt32(data.count))
+        references.append(Reference(patchOffset: patchOffset,
+                                    variableOffset: variable.count,
+                                    length: data.count))
+        variable.append(data)
+        return true
+    }
+
+    mutating func finalize() -> Data? {
+        guard fixed.count <= Int(UInt32.max),
+              variable.count <= Int(UInt32.max),
+              variable.count <= Int(UInt32.max) - fixed.count else {
+            return nil
+        }
+
+        for reference in references {
+            let offset = referenceBaseOffset + fixed.count + reference.variableOffset
+            guard offset <= Int(UInt32.max),
+                  reference.length <= Int(UInt32.max) else {
+                return nil
+            }
+            fixed.replaceLittleEndianUInt32(at: reference.patchOffset, with: UInt32(offset))
+            fixed.replaceLittleEndianUInt32(at: reference.patchOffset + 4, with: UInt32(reference.length))
+        }
+
+        var payload = Data(capacity: fixed.count + variable.count)
+        payload.append(fixed)
+        payload.append(variable)
+        return payload
+    }
+}
+
+private struct BinaryPayloadCursor {
+    private let data: Data
+    private var offset = 0
+
+    init(_ data: Data) {
+        self.data = data
+    }
+
+    mutating func readUInt32() -> UInt32? {
+        guard offset + 4 <= data.count else { return nil }
+        var value: UInt32 = 0
+        for index in 0..<4 {
+            value |= UInt32(data[offset + index]) << UInt32(index * 8)
+        }
+        offset += 4
+        return value
+    }
+
+    mutating func readUInt64() -> UInt64? {
+        guard offset + 8 <= data.count else { return nil }
+        var value: UInt64 = 0
+        for index in 0..<8 {
+            value |= UInt64(data[offset + index]) << UInt64(index * 8)
+        }
+        offset += 8
+        return value
+    }
+
+    mutating func readUUID() -> UUID? {
+        guard offset + 16 <= data.count else { return nil }
+        let bytes = data.subdata(in: offset..<(offset + 16))
+        offset += 16
+        return bytes.withUnsafeBytes { raw -> UUID? in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            return NSUUID(uuidBytes: base) as UUID
+        }
+    }
+
+    mutating func readStringReference() -> String? {
+        guard let data = readDataReference() else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private mutating func readDataReference() -> Data? {
+        guard let offsetValue = readUInt32(),
+              let lengthValue = readUInt32() else {
+            return nil
+        }
+
+        let start = Int(offsetValue)
+        let length = Int(lengthValue)
+        guard start <= data.count,
+              length <= data.count - start else {
+            return nil
+        }
+        return data.subdata(in: start..<(start + length))
+    }
+}
+
+private extension Data {
+    mutating func appendLittleEndian(_ value: UInt32) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) { append(contentsOf: $0) }
+    }
+
+    mutating func replaceLittleEndianUInt32(at offset: Int, with value: UInt32) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) {
+            replaceSubrange(offset..<(offset + 4), with: $0)
+        }
+    }
+}
+
+private final class FilesHandler: NSObject, OuterframeHostDelegate {
+    private static let droppedFileAccessPasteboardTypeIdentifier = "org.outerframe.dropped-file-access"
+
+    private let outerframeHost: OuterframeHost
+    private let appConnection: OuterframeAppConnection
+    private var retainedSelf: FilesHandler?
+
+    private let rootLayer = CALayer()
+    private let favoritesBarLayer = CALayer()
+    private let breadcrumbBarLayer = CALayer()
+    private let headerLayer = CALayer()
+    private let nameHeaderLayer = CATextLayer()
+    private let modifiedHeaderLayer = CATextLayer()
+    private let sizeHeaderLayer = CATextLayer()
+    private let rowsClipLayer = CALayer()
+    private let statusLayer = CATextLayer()
+
+    private var appearance = NSAppearance.currentDrawing()
+    private var currentSize = CGSize(width: 900, height: 600)
+    private var urlSession: URLSession?
+    private var filesEndpoint: URL?
+    private var downloadEndpoint: URL?
+    private var uploadEndpoint: URL?
+    private var mkdirEndpoint: URL?
+    private var currentPath = "~"
+    private var homePath: String?
+    private var parentPath: String?
+    private var entries: [FileEntry] = []
+    private var selectedIndex: Int?
+    private var dragCandidateIndex: Int?
+    private var dragStartPoint: CGPoint?
+    private var dragStartedForSelectionIndex: Int?
+    private var isDraggingFolderToFavorites = false
+    private var filePromiseEntries: [UUID: FileEntry] = [:]
+    private var favoriteLocations: [FavoriteLocation] = []
+    private var scrollOffset: CGFloat = 0
+    private var isLoading = false
+    private var hasRegisteredLayer = false
+    private var shouldReplaceHistoryEntryAfterLoad = false
+    private var favoriteFrames: [(frame: CGRect, path: String)] = []
+    private var breadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
+    private var pendingFavoriteMenuEntries: [UUID: FileEntry] = [:]
+
+    private let favoritesBarHeight: CGFloat = 36
+    private let breadcrumbBarHeight: CGFloat = 34
+    private let headerHeight: CGFloat = 28
+    private let rowHeight: CGFloat = 26
+    private let horizontalInset: CGFloat = 18
+    private let nameColumnWidth: CGFloat = 0.58
+    private let modifiedColumnWidth: CGFloat = 0.24
+
+    private var topChromeHeight: CGFloat {
+        favoritesBarHeight + breadcrumbBarHeight
+    }
+
+    init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
+        self.outerframeHost = outerframeHost
+        self.appConnection = appConnection
+        super.init()
+        retainedSelf = self
+    }
+
+    func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
+        switch message {
+        case .initializeContent(let arguments):
+            outerframeHost.configure(url: arguments.url ?? "",
+                                     bundleUrl: arguments.bundleUrl ?? "",
+                                     proxyHost: arguments.proxy?.host,
+                                     proxyPort: arguments.proxy?.port ?? 0,
+                                     proxyUsername: arguments.proxy?.username,
+                                     proxyPassword: arguments.proxy?.password)
+            appearance = arguments.appearance ?? appearance
+            currentSize = arguments.contentSize ?? currentSize
+            configureNetworking()
+            configureLayersIfNeeded()
+            updateColors()
+            updateLayout()
+            registerRootLayerIfNeeded()
+            outerframeHost.setInputMode(.rawKeys)
+            updatePasteboardCapabilities()
+            let initialURLPath = pathFromURL(arguments.url)
+            let initialPath = initialURLPath ?? currentPath
+            fetchFiles(path: initialPath,
+                       replaceHistoryEntryAfterLoad: initialURLPath == nil)
+
+        case .resizeContent(let size):
+            currentSize = size
+            clampScrollOffset()
+            updateLayout()
+
+        case .systemAppearanceUpdate(let appearance):
+            self.appearance = appearance
+            updateColors()
+
+        case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
+            guard rowsClipLayer.frame.contains(rootLayer.convert(point, to: rowsClipLayer.superlayer)) else { return }
+            let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
+            scrollOffset -= delta.y * multiplier
+            clampScrollOffset()
+            updateRows()
+
+        case .mouseDown(let point, _, let clickCount):
+            handleMouseDown(at: point, clickCount: clickCount)
+
+        case .mouseDragged(let point, let modifierFlags):
+            handleMouseDragged(to: point, modifierFlags: modifierFlags)
+
+        case .mouseUp(let point, _):
+            handleMouseUp(at: point)
+
+        case .rightMouseDown(let point, _, _):
+            handleRightMouseDown(at: point)
+
+        case .keyDown(let keyCode, _, _, _, _):
+            handleKeyDown(keyCode: keyCode)
+
+        case .selectionToPasteboardCopyRequest(let requestID):
+            handleSelectionToPasteboardCopyRequest(requestID: requestID)
+
+        case .pasteboardContentPasted(let items):
+            handleDroppedPasteboardItems(items, at: CGPoint(x: rowsClipLayer.bounds.midX, y: rowsClipLayer.bounds.midY))
+
+        case .pasteboardContentDropped(let point, let items):
+            handleDroppedPasteboardItems(items, at: point)
+
+        case .filePromiseWriteRequest(let requestID, let promiseID):
+            handleFilePromiseWriteRequest(requestID: requestID, promiseID: promiseID)
+
+        case .contextMenuItemSelected(let menuID, let itemID):
+            handleContextMenuItemSelected(menuID: menuID, itemID: itemID)
+
+        case .historyTraversal(_, let url):
+            fetchFiles(path: pathFromURL(url) ?? currentPath)
+
+        case .accessibilitySnapshotRequest(let requestID):
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
+                                                             snapshot: OuterframeAccessibilitySnapshot.notImplementedSnapshot())
+
+        case .shutdown:
+            retainedSelf = nil
+
+        default:
+            break
+        }
+    }
+
+    func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        retainedSelf = nil
+    }
+
+    private func configureNetworking() {
+        if let base = outerframeHost.pluginBaseURL() {
+            filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
+            downloadEndpoint = URL(string: "/api/download", relativeTo: base)?.absoluteURL
+            uploadEndpoint = URL(string: "/api/upload", relativeTo: base)?.absoluteURL
+            mkdirEndpoint = URL(string: "/api/mkdir", relativeTo: base)?.absoluteURL
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        outerframeHost.applyProxy(to: configuration)
+        urlSession = URLSession(configuration: configuration)
+    }
+
+    private func configureLayersIfNeeded() {
+        guard favoritesBarLayer.superlayer == nil else { return }
+
+        rootLayer.masksToBounds = true
+        rootLayer.addSublayer(favoritesBarLayer)
+        rootLayer.addSublayer(breadcrumbBarLayer)
+        rootLayer.addSublayer(headerLayer)
+        rootLayer.addSublayer(rowsClipLayer)
+        rootLayer.addSublayer(statusLayer)
+
+        headerLayer.addSublayer(nameHeaderLayer)
+        headerLayer.addSublayer(modifiedHeaderLayer)
+        headerLayer.addSublayer(sizeHeaderLayer)
+
+        for layer in [nameHeaderLayer, modifiedHeaderLayer, sizeHeaderLayer, statusLayer] {
+            layer.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+            layer.fontSize = 12
+            layer.contentsScale = 2
+            layer.truncationMode = .end
+        }
+        nameHeaderLayer.string = "Name"
+        modifiedHeaderLayer.string = "Modified"
+        sizeHeaderLayer.string = "Size"
+        sizeHeaderLayer.alignmentMode = .right
+        statusLayer.alignmentMode = .center
+    }
+
+    private func updateLayout() {
+        withoutImplicitAnimations {
+            let width = max(currentSize.width, 1)
+            let height = max(currentSize.height, 1)
+            rootLayer.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+
+            favoritesBarLayer.frame = CGRect(x: 0,
+                                             y: max(height - favoritesBarHeight, 0),
+                                             width: width,
+                                             height: favoritesBarHeight)
+            breadcrumbBarLayer.frame = CGRect(x: 0,
+                                              y: max(height - topChromeHeight, 0),
+                                              width: width,
+                                              height: breadcrumbBarHeight)
+
+            let headerY = max(height - topChromeHeight - headerHeight, 0)
+            headerLayer.frame = CGRect(x: 0, y: headerY, width: width, height: headerHeight)
+            let contentWidth = max(width - horizontalInset * 2, 1)
+            let nameWidth = floor(contentWidth * nameColumnWidth)
+            let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
+            let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
+            nameHeaderLayer.frame = CGRect(x: horizontalInset, y: 7, width: nameWidth, height: 16)
+            modifiedHeaderLayer.frame = CGRect(x: horizontalInset + nameWidth, y: 7, width: modifiedWidth, height: 16)
+            sizeHeaderLayer.frame = CGRect(x: horizontalInset + nameWidth + modifiedWidth, y: 7, width: sizeWidth, height: 16)
+
+            rowsClipLayer.frame = CGRect(x: 0, y: 0, width: width, height: headerY)
+            statusLayer.frame = CGRect(x: horizontalInset, y: max(headerY - 30, 0), width: contentWidth, height: 18)
+            updateFavoritesBar()
+            updateBreadcrumbBar()
+            updateRows()
+        }
+    }
+
+    private func updateColors() {
+        appearance.performAsCurrentDrawingAppearance {
+            withoutImplicitAnimations {
+                rootLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+                favoritesBarLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
+                breadcrumbBarLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.92).cgColor
+                headerLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.92).cgColor
+                nameHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                modifiedHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                sizeHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                updateFavoritesBar()
+                updateBreadcrumbBar()
+                updateRows()
+            }
+        }
+    }
+
+    private func updateFavoritesBar() {
+        withoutImplicitAnimations {
+            favoritesBarLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            favoriteFrames.removeAll()
+
+            appearance.performAsCurrentDrawingAppearance {
+                if isDraggingFolderToFavorites {
+                    let dropLayer = CALayer()
+                    dropLayer.frame = favoritesBarLayer.bounds.insetBy(dx: horizontalInset - 4, dy: 4)
+                    dropLayer.cornerRadius = 7
+                    dropLayer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor
+                    favoritesBarLayer.addSublayer(dropLayer)
+                }
+
+                var x = horizontalInset
+                x = addFavoriteLayer(title: "Home",
+                                     path: homePath ?? "~",
+                                     x: x)
+                for favorite in favoriteLocations {
+                    guard x < favoritesBarLayer.bounds.width - horizontalInset else { break }
+                    x = addFavoriteLayer(title: favorite.title,
+                                         path: favorite.path,
+                                         x: x)
+                }
+            }
+        }
+    }
+
+    private func addFavoriteLayer(title: String,
+                                  path: String,
+                                  x: CGFloat) -> CGFloat {
+        let availableWidth = max(favoritesBarLayer.bounds.width - x - horizontalInset, 0)
+        guard availableWidth >= 44 else { return favoritesBarLayer.bounds.width }
+
+        let textLayerWidth = min(textWidth(title, fontSize: 13, weight: .medium), 126)
+        let width = min(max(textLayerWidth + 42, 80), availableWidth)
+        let frame = CGRect(x: x, y: 6, width: width, height: 24)
+        favoriteFrames.append((frame, path))
+
+        let itemLayer = CALayer()
+        itemLayer.frame = frame
+        itemLayer.cornerRadius = 6
+        if path == currentPath {
+            itemLayer.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.24).cgColor
+        }
+
+        let iconLayer = CALayer()
+        iconLayer.frame = CGRect(x: 8, y: 4, width: 16, height: 16)
+        iconLayer.contentsGravity = .resizeAspect
+        iconLayer.contentsScale = 2
+        iconLayer.contents = folderIconCGImage(size: CGSize(width: 16, height: 16))
+        itemLayer.addSublayer(iconLayer)
+
+        let textLayer = makeTextLayer(size: 13, weight: .medium)
+        textLayer.string = title
+        textLayer.frame = CGRect(x: 30, y: 4, width: max(width - 38, 1), height: 17)
+        itemLayer.addSublayer(textLayer)
+
+        favoritesBarLayer.addSublayer(itemLayer)
+        return x + width + 8
+    }
+
+    private func updateBreadcrumbBar() {
+        withoutImplicitAnimations {
+            breadcrumbBarLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            breadcrumbSegmentFrames.removeAll()
+
+            appearance.performAsCurrentDrawingAppearance {
+                var x = horizontalInset
+                let segments = breadcrumbSegments()
+                for (index, segment) in segments.enumerated() {
+                    if index > 0 {
+                        let separatorLayer = makeTextLayer(size: 13, weight: .regular)
+                        separatorLayer.string = ">"
+                        separatorLayer.foregroundColor = NSColor.tertiaryLabelColor.cgColor
+                        separatorLayer.frame = CGRect(x: x, y: 9, width: 14, height: 16)
+                        breadcrumbBarLayer.addSublayer(separatorLayer)
+                        x += 18
+                    }
+
+                    let width = min(max(textWidth(segment.title, fontSize: 13, weight: .medium) + 18, 28),
+                                    max(breadcrumbBarLayer.bounds.width - x - horizontalInset, 28))
+                    let frame = CGRect(x: x, y: 5, width: width, height: 24)
+                    breadcrumbSegmentFrames.append((frame, segment.path))
+
+                    let segmentLayer = CALayer()
+                    segmentLayer.frame = frame
+                    segmentLayer.cornerRadius = 6
+                    if segment.path == currentPath {
+                        segmentLayer.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.18).cgColor
+                    }
+
+                    let textLayer = makeTextLayer(size: 13, weight: .medium)
+                    textLayer.string = segment.title
+                    textLayer.frame = CGRect(x: 9, y: 4, width: max(width - 18, 1), height: 17)
+                    segmentLayer.addSublayer(textLayer)
+                    breadcrumbBarLayer.addSublayer(segmentLayer)
+
+                    x += width
+                    if x >= breadcrumbBarLayer.bounds.width - horizontalInset {
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    private func breadcrumbSegments() -> [BreadcrumbSegment] {
+        var segments = [BreadcrumbSegment(title: "/", path: "/")]
+        var accumulatedPath = ""
+        for component in currentPath.split(separator: "/", omittingEmptySubsequences: true) {
+            accumulatedPath += "/" + component
+            segments.append(BreadcrumbSegment(title: String(component), path: accumulatedPath))
+        }
+        return segments
+    }
+
+    private static func inferHomePath(from path: String) -> String? {
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count >= 2 else { return nil }
+
+        if components[0] == "home" || components[0] == "Users" {
+            return "/\(components[0])/\(components[1])"
+        }
+
+        return nil
+    }
+
+    private func registerRootLayerIfNeeded() {
+        guard !hasRegisteredLayer, let registerLayer = appConnection.registerLayer else { return }
+        registerLayer(rootLayer)
+        hasRegisteredLayer = true
+    }
+
+    private func pathFromURL(_ urlString: String?) -> String? {
+        guard let urlString,
+              let components = URLComponents(string: urlString),
+              let path = components.queryItems?.first(where: { $0.name == "path" })?.value,
+              !path.isEmpty else {
+            return nil
+        }
+        return path
+    }
+
+    private func urlForPath(_ path: String) -> URL? {
+        guard let url = outerframeHost.pluginURL(),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { $0.name == "path" }
+        queryItems.append(URLQueryItem(name: "path", value: path))
+        components.queryItems = queryItems
+        return components.url
+    }
+
+    private func openDirectory(path: String) {
+        if let url = urlForPath(path) {
+            outerframeHost.pushHistoryEntry(url: url)
+        }
+        fetchFiles(path: path, replaceHistoryEntryAfterLoad: path == "~" || path.hasPrefix("~/"))
+    }
+
+    private func fetchFiles(path: String, replaceHistoryEntryAfterLoad: Bool = false) {
+        guard !isLoading, let filesEndpoint else { return }
+        isLoading = true
+        shouldReplaceHistoryEntryAfterLoad = replaceHistoryEntryAfterLoad
+        statusLayer.string = "Loading..."
+
+        var components = URLComponents(url: filesEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            isLoading = false
+            shouldReplaceHistoryEntryAfterLoad = false
+            statusLayer.string = "Could not build file request"
+            return
+        }
+
+        urlSession?.dataTask(with: url) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isLoading = false
+                if let error {
+                    self.shouldReplaceHistoryEntryAfterLoad = false
+                    self.statusLayer.string = error.localizedDescription
+                    return
+                }
+                guard let data else {
+                    self.shouldReplaceHistoryEntryAfterLoad = false
+                    self.statusLayer.string = "No response"
+                    return
+                }
+                do {
+                    let response = try JSONDecoder().decode(FileListResponse.self, from: data)
+                    self.currentPath = response.path
+                    if self.homePath == nil {
+                        self.homePath = Self.inferHomePath(from: response.path) ?? (path == "~" ? response.path : nil)
+                    }
+                    self.parentPath = response.parent
+                    self.entries = response.entries
+                    self.selectedIndex = nil
+                    self.dragCandidateIndex = nil
+                    self.dragStartPoint = nil
+                    self.dragStartedForSelectionIndex = nil
+                    self.isDraggingFolderToFavorites = false
+                    self.scrollOffset = 0
+                    self.statusLayer.string = response.entries.isEmpty ? "Empty folder" : ""
+                    self.clampScrollOffset()
+                    self.updateFavoritesBar()
+                    self.updateBreadcrumbBar()
+                    self.updateRows()
+                    self.updatePasteboardCapabilities()
+                    if self.shouldReplaceHistoryEntryAfterLoad,
+                       let url = self.urlForPath(response.path) {
+                        self.outerframeHost.replaceHistoryEntry(url: url)
+                    }
+                    self.shouldReplaceHistoryEntryAfterLoad = false
+                } catch {
+                    self.statusLayer.string = "Could not read file list"
+                    self.shouldReplaceHistoryEntryAfterLoad = false
+                }
+            }
+        }.resume()
+    }
+
+    private func updateRows() {
+        withoutImplicitAnimations {
+            rowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            guard !entries.isEmpty else { return }
+
+            appearance.performAsCurrentDrawingAppearance {
+                let visibleStart = max(Int(floor(scrollOffset / rowHeight)), 0)
+                let visibleCount = Int(ceil(rowsClipLayer.bounds.height / rowHeight)) + 2
+                let visibleEnd = min(entries.count, visibleStart + visibleCount)
+                let contentWidth = max(rowsClipLayer.bounds.width - horizontalInset * 2, 1)
+                let nameWidth = floor(contentWidth * nameColumnWidth)
+                let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
+                let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
+                let rowColors = alternatingRowColors()
+                let selectedBackgroundColor = NSColor.controlAccentColor.cgColor
+                let selectedTextColor = NSColor.white.cgColor
+                let bodyTextColor = NSColor.labelColor.cgColor
+                let secondaryTextColor = NSColor.secondaryLabelColor.cgColor
+
+                for index in visibleStart..<visibleEnd {
+                    let entry = entries[index]
+                    let isSelected = selectedIndex == index
+                    let top = rowsClipLayer.bounds.height - CGFloat(index) * rowHeight + scrollOffset - rowHeight
+                    let rowLayer = CALayer()
+                    rowLayer.frame = CGRect(x: 0, y: top, width: rowsClipLayer.bounds.width, height: rowHeight)
+
+                    if isSelected {
+                        rowLayer.backgroundColor = selectedBackgroundColor
+                    } else if index.isMultiple(of: 2) {
+                        rowLayer.backgroundColor = rowColors.even
+                    } else {
+                        rowLayer.backgroundColor = rowColors.odd
+                    }
+
+                    let iconLayer = CALayer()
+                    iconLayer.frame = CGRect(x: horizontalInset, y: 5, width: 16, height: 16)
+                    iconLayer.contentsGravity = .resizeAspect
+                    iconLayer.contentsScale = 2
+                    iconLayer.contents = rowIconCGImage(for: entry, size: CGSize(width: 16, height: 16))
+
+                    let nameLayer = makeTextLayer(size: 13, weight: .regular)
+                    nameLayer.string = entry.name
+                    nameLayer.foregroundColor = isSelected ? selectedTextColor : bodyTextColor
+                    nameLayer.frame = CGRect(x: horizontalInset + 24, y: 5, width: max(nameWidth - 24, 1), height: 17)
+
+                    let modifiedLayer = makeTextLayer(size: 12, weight: .regular)
+                    modifiedLayer.string = formatModified(entry.modified)
+                    modifiedLayer.foregroundColor = isSelected ? selectedTextColor : secondaryTextColor
+                    modifiedLayer.frame = CGRect(x: horizontalInset + nameWidth, y: 5, width: modifiedWidth, height: 17)
+
+                    let sizeLayer = makeTextLayer(size: 12, weight: .regular, alignment: .right)
+                    sizeLayer.string = entry.isDirectory ? "--" : formatByteCount(entry.size)
+                    sizeLayer.foregroundColor = isSelected ? selectedTextColor : secondaryTextColor
+                    sizeLayer.frame = CGRect(x: horizontalInset + nameWidth + modifiedWidth, y: 5, width: sizeWidth, height: 17)
+
+                    rowLayer.addSublayer(iconLayer)
+                    rowLayer.addSublayer(nameLayer)
+                    rowLayer.addSublayer(modifiedLayer)
+                    rowLayer.addSublayer(sizeLayer)
+                    rowsClipLayer.addSublayer(rowLayer)
+                }
+            }
+        }
+    }
+
+    private func handleMouseDown(at point: CGPoint, clickCount: Int) {
+        dragCandidateIndex = nil
+        dragStartPoint = nil
+        dragStartedForSelectionIndex = nil
+        isDraggingFolderToFavorites = false
+
+        if let favoritePath = favoritePath(at: point) {
+            selectedIndex = nil
+            updateRows()
+            updatePasteboardCapabilities()
+            updateFavoritesBar()
+            openDirectory(path: favoritePath)
+            return
+        }
+
+        if let breadcrumbPath = breadcrumbPath(at: point) {
+            selectedIndex = nil
+            updateRows()
+            updatePasteboardCapabilities()
+            updateFavoritesBar()
+            openDirectory(path: breadcrumbPath)
+            return
+        }
+
+        let index = rowIndex(at: point)
+        guard index >= 0, index < entries.count else {
+            selectedIndex = nil
+            updateRows()
+            updatePasteboardCapabilities()
+            updateFavoritesBar()
+            return
+        }
+
+        selectedIndex = index
+        dragCandidateIndex = index
+        dragStartPoint = point
+        updateRows()
+        updatePasteboardCapabilities()
+        updateFavoritesBar()
+
+        if clickCount >= 2, entries[index].isDirectory {
+            dragCandidateIndex = nil
+            dragStartPoint = nil
+            openDirectory(path: entries[index].path)
+        }
+    }
+
+    private func handleMouseDragged(to point: CGPoint, modifierFlags _: NSEvent.ModifierFlags) {
+        guard let selectedIndex,
+              dragCandidateIndex == selectedIndex,
+              dragStartedForSelectionIndex != selectedIndex,
+              entries.indices.contains(selectedIndex) else {
+            return
+        }
+
+        let entry = entries[selectedIndex]
+        if entry.isDirectory {
+            if favoritesBarContains(point) {
+                if !isDraggingFolderToFavorites {
+                    isDraggingFolderToFavorites = true
+                    updateFavoritesBar()
+                }
+                return
+            }
+
+            if isDraggingFolderToFavorites {
+                isDraggingFolderToFavorites = false
+                updateFavoritesBar()
+            }
+
+            if let dragStartPoint, point.y > dragStartPoint.y + 4 {
+                return
+            }
+        }
+
+        dragStartedForSelectionIndex = selectedIndex
+        beginDraggingFilePromise(for: entry)
+    }
+
+    private func handleMouseUp(at point: CGPoint) {
+        defer {
+            dragCandidateIndex = nil
+            dragStartPoint = nil
+            dragStartedForSelectionIndex = nil
+            if isDraggingFolderToFavorites {
+                isDraggingFolderToFavorites = false
+                updateFavoritesBar()
+            }
+        }
+
+        guard let selectedIndex,
+              dragCandidateIndex == selectedIndex,
+              entries.indices.contains(selectedIndex) else {
+            return
+        }
+
+        let entry = entries[selectedIndex]
+        guard entry.isDirectory, favoritesBarContains(point) else { return }
+        addFavorite(entry)
+    }
+
+    private func handleKeyDown(keyCode: UInt16) {
+        switch keyCode {
+        case 126:
+            dragCandidateIndex = nil
+            dragStartPoint = nil
+            moveSelection(delta: -1)
+        case 125:
+            dragCandidateIndex = nil
+            dragStartPoint = nil
+            moveSelection(delta: 1)
+        case 36, 76:
+            if let selectedIndex, entries[selectedIndex].isDirectory {
+                openDirectory(path: entries[selectedIndex].path)
+            }
+        case 51:
+            if let parentPath {
+                openDirectory(path: parentPath)
+            }
+        default:
+            break
+        }
+    }
+
+    private func moveSelection(delta: Int) {
+        guard !entries.isEmpty else { return }
+        let nextIndex = min(max((selectedIndex ?? (delta > 0 ? -1 : entries.count)) + delta, 0), entries.count - 1)
+        selectedIndex = nextIndex
+        let rowTop = CGFloat(nextIndex) * rowHeight
+        let viewportHeight = rowsClipLayer.bounds.height
+        if rowTop < scrollOffset {
+            scrollOffset = rowTop
+        } else if rowTop + rowHeight > scrollOffset + viewportHeight {
+            scrollOffset = rowTop + rowHeight - viewportHeight
+        }
+        clampScrollOffset()
+        updateRows()
+        updatePasteboardCapabilities()
+    }
+
+    private func clampScrollOffset() {
+        let maxOffset = max(CGFloat(entries.count) * rowHeight - rowsClipLayer.bounds.height, 0)
+        scrollOffset = min(max(scrollOffset, 0), maxOffset)
+    }
+
+    private func updatePasteboardCapabilities() {
+        let canCopyFile = selectedIndex.flatMap { entries.indices.contains($0) ? entries[$0] : nil }?.isDirectory == false
+        outerframeHost.setEditingCapabilities(canCopy: canCopyFile, canCut: false)
+        outerframeHost.setAcceptedPasteboardPasteTypes([
+            NSPasteboard.PasteboardType.fileURL.rawValue,
+            Self.droppedFileAccessPasteboardTypeIdentifier
+        ])
+        outerframeHost.setPasteboardDropBehaviorUniform([
+            NSPasteboard.PasteboardType.fileURL.rawValue,
+            Self.droppedFileAccessPasteboardTypeIdentifier,
+            NSPasteboard.PasteboardType.string.rawValue
+        ])
+    }
+
+    private func selectedFileEntryForCopy() -> FileEntry? {
+        guard let selectedIndex,
+              entries.indices.contains(selectedIndex) else { return nil }
+        let entry = entries[selectedIndex]
+        return entry.isDirectory ? nil : entry
+    }
+
+    private func handleSelectionToPasteboardCopyRequest(requestID: UUID) {
+        guard let entry = selectedFileEntryForCopy(),
+              let downloadEndpoint,
+              let urlSession,
+              let stagingDirectoryURL = outerframeHost.stagedFileDirectoryURL else {
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: [])
+            return
+        }
+
+        var components = URLComponents(url: downloadEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: entry.path)]
+        guard let downloadURL = components?.url else {
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: [])
+            return
+        }
+
+        let copyID = UUID()
+        let targetDirectoryURL = stagingDirectoryURL
+            .appendingPathComponent("files-copy-\(copyID.uuidString)", isDirectory: true)
+        let targetURL = targetDirectoryURL
+            .appendingPathComponent(Self.safeStagedFileName(entry.name), isDirectory: false)
+
+        statusLayer.string = "Copying \(entry.name)..."
+        Task { [weak self, urlSession, downloadURL, targetDirectoryURL, targetURL, requestID] in
+            do {
+                try await Self.writeDownload(from: downloadURL,
+                                             using: urlSession,
+                                             to: targetURL,
+                                             creating: targetDirectoryURL)
+                let item = OuterframeContentPasteboardItem(representations: [
+                    OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.fileURL.rawValue,
+                                                              data: Data(targetURL.absoluteString.utf8))
+                ])
+                guard let self else { return }
+                self.statusLayer.string = ""
+                self.outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                                       items: [item])
+            } catch {
+                try? FileManager.default.removeItem(at: targetDirectoryURL)
+                guard let self else { return }
+                self.statusLayer.string = "Copy failed"
+                self.outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                                       items: [])
+                print("Files copy: failed to stage \(targetURL.path): \(error)")
+            }
+        }
+    }
+
+    private func handleRightMouseDown(at point: CGPoint) {
+        let index = rowIndex(at: point)
+        if entries.indices.contains(index), entries[index].isDirectory {
+            let entry = entries[index]
+            selectedIndex = index
+            updateRows()
+            updatePasteboardCapabilities()
+
+            let menuID = UUID()
+            pendingFavoriteMenuEntries[menuID] = entry
+            outerframeHost.showContextMenu(menuID: menuID,
+                                           items: [
+                                            OuterframeContextMenuItem(id: "add-to-favorites",
+                                                                      title: "Add to Favorites",
+                                                                      isEnabled: !isFavoritePath(entry.path))
+                                           ],
+                                           at: point)
+            return
+        }
+
+        if entries.indices.contains(index) {
+            selectedIndex = index
+            updateRows()
+            updatePasteboardCapabilities()
+            outerframeHost.showContextMenu(menuID: UUID(),
+                                           items: [
+                                            OuterframeContextMenuItem(id: "copy",
+                                                                      title: "Copy",
+                                                                      action: .standardCopy)
+                                           ],
+                                           at: point)
+            return
+        }
+
+        outerframeHost.showContextMenu(menuID: UUID(),
+                                       items: [
+                                        OuterframeContextMenuItem(id: "paste",
+                                                                  title: "Paste",
+                                                                  action: .standardPaste)
+                                       ],
+                                       at: point)
+    }
+
+    private func handleContextMenuItemSelected(menuID: UUID, itemID: String) {
+        guard itemID == "add-to-favorites",
+              let entry = pendingFavoriteMenuEntries.removeValue(forKey: menuID) else {
+            return
+        }
+        addFavorite(entry)
+    }
+
+    private func addFavorite(_ entry: FileEntry) {
+        guard entry.isDirectory, !isFavoritePath(entry.path) else { return }
+        favoriteLocations.append(FavoriteLocation(title: entry.name, path: entry.path))
+        updateFavoritesBar()
+    }
+
+    private func isFavoritePath(_ path: String) -> Bool {
+        if let homePath, path == homePath {
+            return true
+        }
+        if homePath == nil, path == "~" {
+            return true
+        }
+        return favoriteLocations.contains { $0.path == path }
+    }
+
+    private func beginDraggingFilePromise(for entry: FileEntry) {
+        guard outerframeHost.stagedFileDirectoryURL != nil else {
+            dragStartedForSelectionIndex = nil
+            statusLayer.string = "Could not prepare drag"
+            print("Files drag: missing staging directory for \(entry.path)")
+            return
+        }
+
+        let promiseID = UUID()
+        filePromiseEntries[promiseID] = entry
+        outerframeHost.beginDraggingFilePromise(
+            promiseID: promiseID,
+            name: entry.name,
+            fileSize: entry.isDirectory ? nil : entry.size,
+            fileType: fileTypeIdentifier(for: entry),
+            operationMask: .copy,
+            previewPNGData: dragPreviewImageData(for: entry),
+            previewSize: CGSize(width: 220, height: 64)
+        )
+    }
+
+    private func handleFilePromiseWriteRequest(requestID: UUID, promiseID: UUID) {
+        guard let entry = filePromiseEntries[promiseID] else {
+            outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
+                                                       promiseID: promiseID,
+                                                       errorMessage: "Unknown file promise.")
+            return
+        }
+        stagePromisedFile(entry: entry, promiseID: promiseID, requestID: requestID)
+    }
+
+    private func stagePromisedFile(entry: FileEntry, promiseID: UUID, requestID: UUID) {
+        guard let downloadEndpoint,
+              let urlSession,
+              let stagingDirectoryURL = outerframeHost.stagedFileDirectoryURL else {
+            outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
+                                                       promiseID: promiseID,
+                                                       errorMessage: "Missing download endpoint, URLSession, or staging directory.")
+            return
+        }
+
+        var components = URLComponents(url: downloadEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: entry.path)]
+        guard let downloadURL = components?.url else {
+            outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
+                                                       promiseID: promiseID,
+                                                       errorMessage: "Could not build download URL.")
+            print("Files drag: failed to build download URL for \(entry.path)")
+            return
+        }
+
+        let targetDirectoryURL = stagingDirectoryURL
+            .appendingPathComponent("files-promise-\(promiseID.uuidString)", isDirectory: true)
+        let targetURL = targetDirectoryURL
+            .appendingPathComponent(Self.safeStagedFileName(entry.name), isDirectory: entry.isDirectory)
+
+        statusLayer.string = "Preparing \(entry.name)..."
+        Task { [weak self, urlSession, downloadURL, targetDirectoryURL, targetURL, entry, promiseID, requestID] in
+            do {
+                if entry.isDirectory {
+                    guard let filesEndpoint = self?.filesEndpoint else {
+                        throw NSError(domain: NSCocoaErrorDomain,
+                                      code: NSFileReadUnknownError,
+                                      userInfo: [NSLocalizedDescriptionKey: "Missing files endpoint."])
+                    }
+                    try await Self.stageRemoteDirectory(path: entry.path,
+                                                        to: targetURL,
+                                                        creating: targetDirectoryURL,
+                                                        filesEndpoint: filesEndpoint,
+                                                        downloadEndpoint: downloadEndpoint,
+                                                        using: urlSession)
+                } else {
+                    try await Self.writeDownload(from: downloadURL,
+                                                 using: urlSession,
+                                                 to: targetURL,
+                                                 creating: targetDirectoryURL)
+                }
+
+                guard let self else { return }
+                self.statusLayer.string = ""
+                self.filePromiseEntries.removeValue(forKey: promiseID)
+                self.outerframeHost.sendFilePromiseWriteResponse(requestID: requestID,
+                                                                 promiseID: promiseID,
+                                                                 localPath: targetURL.path,
+                                                                 deleteWhenDone: true)
+            } catch {
+                try? FileManager.default.removeItem(at: targetDirectoryURL)
+                guard let self else { return }
+                self.dragStartedForSelectionIndex = nil
+                self.statusLayer.string = "Could not prepare drag"
+                self.filePromiseEntries.removeValue(forKey: promiseID)
+                self.outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
+                                                                promiseID: promiseID,
+                                                                errorMessage: String(describing: error))
+                print("Files drag: failed to stage \(entry.path): \(error)")
+            }
+        }
+    }
+
+    private nonisolated static func writeDownload(from downloadURL: URL,
+                                                  using urlSession: URLSession,
+                                                  to targetURL: URL,
+                                                  creating targetDirectoryURL: URL) async throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: targetDirectoryURL,
+                                        withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: targetURL.path) {
+            try fileManager.removeItem(at: targetURL)
+        }
+        let fileDescriptor = open(targetURL.path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard fileDescriptor >= 0 else {
+            let errorCode = errno
+            throw NSError(domain: NSCocoaErrorDomain,
+                          code: NSFileWriteUnknownError,
+                          userInfo: [
+                            NSFilePathErrorKey: targetURL.path,
+                            NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(errorCode))
+                          ])
+        }
+
+        let handle = FileHandle(fileDescriptor: fileDescriptor, closeOnDealloc: true)
+        do {
+            let (bytes, response) = try await urlSession.bytes(from: downloadURL)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200..<300).contains(httpResponse.statusCode) {
+                throw NSError(domain: NSURLErrorDomain,
+                              code: NSURLErrorBadServerResponse,
+                              userInfo: [
+                                NSLocalizedDescriptionKey: "Download failed with HTTP \(httpResponse.statusCode).",
+                                NSURLErrorFailingURLErrorKey: downloadURL
+                              ])
+            }
+
+            var buffer = Data()
+            buffer.reserveCapacity(64 * 1024)
+            for try await byte in bytes {
+                buffer.append(byte)
+                if buffer.count >= 64 * 1024 {
+                    try handle.write(contentsOf: buffer)
+                    buffer.removeAll(keepingCapacity: true)
+                }
+            }
+            if !buffer.isEmpty {
+                try handle.write(contentsOf: buffer)
+            }
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? fileManager.removeItem(at: targetURL)
+            throw error
+        }
+    }
+
+    private nonisolated static func stageRemoteDirectory(path: String,
+                                                         to targetURL: URL,
+                                                         creating targetDirectoryURL: URL,
+                                                         filesEndpoint: URL,
+                                                         downloadEndpoint: URL,
+                                                         using urlSession: URLSession,
+                                                         depth: Int = 0) async throws {
+        guard depth < 64 else {
+            throw NSError(domain: NSCocoaErrorDomain,
+                          code: NSFileReadUnknownError,
+                          userInfo: [NSLocalizedDescriptionKey: "Directory nesting is too deep."])
+        }
+
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: targetDirectoryURL, withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: targetURL.path) {
+            try fileManager.removeItem(at: targetURL)
+        }
+        try fileManager.createDirectory(at: targetURL, withIntermediateDirectories: true)
+
+        let response = try await remoteFileList(path: path,
+                                                filesEndpoint: filesEndpoint,
+                                                using: urlSession)
+        for entry in response.entries {
+            let childURL = targetURL.appendingPathComponent(Self.safeStagedFileName(entry.name),
+                                                            isDirectory: entry.isDirectory)
+            if entry.isDirectory {
+                try await stageRemoteDirectory(path: entry.path,
+                                               to: childURL,
+                                               creating: targetURL,
+                                               filesEndpoint: filesEndpoint,
+                                               downloadEndpoint: downloadEndpoint,
+                                               using: urlSession,
+                                               depth: depth + 1)
+            } else {
+                let downloadURL = try remoteFileDownloadURL(path: entry.path,
+                                                            downloadEndpoint: downloadEndpoint)
+                try await writeDownload(from: downloadURL,
+                                        using: urlSession,
+                                        to: childURL,
+                                        creating: targetURL)
+            }
+        }
+    }
+
+    private nonisolated static func remoteFileList(path: String,
+                                                   filesEndpoint: URL,
+                                                   using urlSession: URLSession) async throws -> FileListResponse {
+        var components = URLComponents(url: filesEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadURL,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not build directory listing URL."])
+        }
+
+        let (data, response) = try await urlSession.data(from: url)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200..<300).contains(httpResponse.statusCode) {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadServerResponse,
+                          userInfo: [
+                            NSLocalizedDescriptionKey: "Directory listing failed with HTTP \(httpResponse.statusCode).",
+                            NSURLErrorFailingURLErrorKey: url
+                          ])
+        }
+        return try JSONDecoder().decode(FileListResponse.self, from: data)
+    }
+
+    private nonisolated static func remoteFileDownloadURL(path: String,
+                                                          downloadEndpoint: URL) throws -> URL {
+        var components = URLComponents(url: downloadEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadURL,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not build download URL."])
+        }
+        return url
+    }
+
+    private nonisolated static func safeStagedFileName(_ name: String) -> String {
+        let sanitized = name
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+        return sanitized.isEmpty ? "Untitled" : sanitized
+    }
+
+    private func fileTypeIdentifier(for entry: FileEntry) -> String {
+        if entry.isDirectory {
+            return UTType.folder.identifier
+        }
+        return fileTypeIdentifier(forFileName: entry.name)
+    }
+
+    private func fileTypeIdentifier(forFileName fileName: String) -> String {
+        let fileExtension = URL(fileURLWithPath: fileName).pathExtension
+        if !fileExtension.isEmpty,
+           let contentType = UTType(filenameExtension: fileExtension),
+           !contentType.identifier.hasPrefix("dyn.") {
+            return contentType.identifier
+        }
+        return UTType.data.identifier
+    }
+
+    private func fileIcon(for fileName: String) -> NSImage {
+        let fileExtension = URL(fileURLWithPath: fileName).pathExtension
+        if !fileExtension.isEmpty,
+           let contentType = UTType(filenameExtension: fileExtension) {
+            return NSWorkspace.shared.icon(for: contentType)
+        }
+        return NSWorkspace.shared.icon(for: UTType.data)
+    }
+
+    private func rowIconCGImage(for entry: FileEntry, size: CGSize) -> CGImage? {
+        if entry.isDirectory {
+            return folderIconCGImage(size: size)
+        }
+        return fileIconCGImage(for: entry.name, size: size)
+    }
+
+    private func fileIconCGImage(for fileName: String, size: CGSize) -> CGImage? {
+        let image = fileIcon(for: fileName).copy() as? NSImage ?? fileIcon(for: fileName)
+        image.size = size
+        var rect = NSRect(origin: .zero, size: size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    }
+
+    private func dragPreviewImageData(for entry: FileEntry) -> Data? {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let width: CGFloat = 220
+        let height: CGFloat = 64
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                            pixelsWide: Int(width * scale),
+                                            pixelsHigh: Int(height * scale),
+                                            bitsPerSample: 8,
+                                            samplesPerPixel: 4,
+                                            hasAlpha: true,
+                                            isPlanar: false,
+                                            colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0,
+                                            bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            return nil
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.cgContext.scaleBy(x: scale, y: scale)
+        defer {
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        let rect = NSRect(x: 0, y: 0, width: width, height: height)
+        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+        NSColor.separatorColor.withAlphaComponent(0.35).setStroke()
+        NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).stroke()
+
+        let sourceIcon = entry.isDirectory ? NSWorkspace.shared.icon(for: UTType.folder) : fileIcon(for: entry.name)
+        let icon = sourceIcon.copy() as? NSImage ?? sourceIcon
+        icon.size = NSSize(width: 38, height: 38)
+        icon.draw(in: NSRect(x: 14, y: 13, width: 38, height: 38))
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph
+        ]
+        let subtitleAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph
+        ]
+
+        (entry.name as NSString).draw(in: NSRect(x: 64, y: 34, width: 142, height: 17),
+                                      withAttributes: titleAttributes)
+
+        let previewExtension = URL(fileURLWithPath: entry.name).pathExtension.uppercased()
+        let subtitle = entry.isDirectory
+            ? "Folder"
+            : "\(formatByteCount(entry.size)) - \(previewExtension.isEmpty ? "File" : previewExtension)"
+        (subtitle as NSString).draw(in: NSRect(x: 64, y: 15, width: 142, height: 15),
+                                    withAttributes: subtitleAttributes)
+
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    private func rowIndex(at point: CGPoint) -> Int {
+        let localPoint = rowsClipLayer.convert(point, from: rootLayer)
+        guard rowsClipLayer.bounds.contains(localPoint) else { return -1 }
+        return Int(floor((rowsClipLayer.bounds.height - localPoint.y + scrollOffset) / rowHeight))
+    }
+
+    private func favoritePath(at point: CGPoint) -> String? {
+        let localPoint = favoritesBarLayer.convert(point, from: rootLayer)
+        guard favoritesBarLayer.bounds.contains(localPoint) else { return nil }
+
+        for favorite in favoriteFrames where favorite.frame.contains(localPoint) {
+            return favorite.path
+        }
+        return nil
+    }
+
+    private func favoritesBarContains(_ point: CGPoint) -> Bool {
+        let localPoint = favoritesBarLayer.convert(point, from: rootLayer)
+        return favoritesBarLayer.bounds.contains(localPoint)
+    }
+
+    private func breadcrumbPath(at point: CGPoint) -> String? {
+        let localPoint = breadcrumbBarLayer.convert(point, from: rootLayer)
+        guard breadcrumbBarLayer.bounds.contains(localPoint) else { return nil }
+
+        for segment in breadcrumbSegmentFrames where segment.frame.contains(localPoint) {
+            return segment.path
+        }
+        return nil
+    }
+
+    private func uploadDirectory(forDropAt point: CGPoint) -> String {
+        let index = rowIndex(at: point)
+        if index >= 0,
+           index < entries.count,
+           entries[index].isDirectory {
+            return entries[index].path
+        }
+        return currentPath
+    }
+
+    private func handleDroppedPasteboardItems(_ items: [OuterframeContentPasteboardItem], at point: CGPoint) {
+        let files = items.compactMap(decodeDroppedLocalFile)
+        guard !files.isEmpty else { return }
+        upload(files: files, to: uploadDirectory(forDropAt: point))
+    }
+
+    private func decodeDroppedLocalFile(_ item: OuterframeContentPasteboardItem) -> DroppedLocalFile? {
+        guard let representation = item.representations.first(where: {
+            $0.typeIdentifier == Self.droppedFileAccessPasteboardTypeIdentifier
+        }) else {
+            return nil
+        }
+
+        guard let payload = OuterframePasteboardPayload.decodeDroppedFileAccess(representation.data) else {
+            return nil
+        }
+
+        return DroppedLocalFile(id: payload.id,
+                                fileURL: URL(fileURLWithPath: payload.localPath, isDirectory: payload.isDirectory),
+                                name: payload.name,
+                                fileSize: payload.fileSize,
+                                fileType: payload.fileType,
+                                isDirectory: payload.isDirectory)
+    }
+
+    private func upload(files: [DroppedLocalFile], to directory: String) {
+        guard let uploadEndpoint, let mkdirEndpoint, let urlSession else { return }
+        statusLayer.string = "Uploading \(files.count) file\(files.count == 1 ? "" : "s")..."
+
+        Task { [weak self, files, directory, uploadEndpoint, mkdirEndpoint, urlSession] in
+            var hadFailure = false
+            for file in files {
+                do {
+                    try await Self.uploadLocalItem(fileURL: file.fileURL,
+                                                   name: file.name,
+                                                   isDirectory: file.isDirectory,
+                                                   to: directory,
+                                                   uploadEndpoint: uploadEndpoint,
+                                                   mkdirEndpoint: mkdirEndpoint,
+                                                   using: urlSession)
+                } catch {
+                    hadFailure = true
+                    print("Files upload: failed to upload \(file.fileURL.path): \(error)")
+                }
+                self?.outerframeHost.releaseDroppedFileAccess(file.id)
+            }
+
+            guard let self else { return }
+            self.statusLayer.string = hadFailure ? "Upload failed" : ""
+            self.fetchFiles(path: self.currentPath)
+        }
+    }
+
+    private nonisolated static func uploadLocalItem(fileURL: URL,
+                                                    name: String,
+                                                    isDirectory: Bool,
+                                                    to remoteDirectory: String,
+                                                    uploadEndpoint: URL,
+                                                    mkdirEndpoint: URL,
+                                                    using urlSession: URLSession,
+                                                    depth: Int = 0) async throws {
+        guard depth < 64 else {
+            throw NSError(domain: NSCocoaErrorDomain,
+                          code: NSFileReadUnknownError,
+                          userInfo: [NSLocalizedDescriptionKey: "Directory nesting is too deep."])
+        }
+
+        if isDirectory {
+            try await createRemoteDirectory(parent: remoteDirectory,
+                                            name: name,
+                                            mkdirEndpoint: mkdirEndpoint,
+                                            using: urlSession)
+            let childRemoteDirectory = remoteChildPath(parent: remoteDirectory, name: name)
+            let childURLs = try FileManager.default.contentsOfDirectory(at: fileURL,
+                                                                        includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                                                                        options: [])
+            for childURL in childURLs {
+                let values = try childURL.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+                guard values.isDirectory == true || values.isRegularFile == true else { continue }
+                try await uploadLocalItem(fileURL: childURL,
+                                          name: childURL.lastPathComponent,
+                                          isDirectory: values.isDirectory == true,
+                                          to: childRemoteDirectory,
+                                          uploadEndpoint: uploadEndpoint,
+                                          mkdirEndpoint: mkdirEndpoint,
+                                          using: urlSession,
+                                          depth: depth + 1)
+            }
+            return
+        }
+
+        var components = URLComponents(url: uploadEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "directory", value: remoteDirectory),
+            URLQueryItem(name: "name", value: name)
+        ]
+        guard let url = components?.url else {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadURL,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not build upload URL."])
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        let (_, response) = try await urlSession.upload(for: request, fromFile: fileURL)
+        if let http = response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadServerResponse,
+                          userInfo: [NSLocalizedDescriptionKey: "Upload failed with HTTP \(http.statusCode)."])
+        }
+    }
+
+    private nonisolated static func createRemoteDirectory(parent: String,
+                                                          name: String,
+                                                          mkdirEndpoint: URL,
+                                                          using urlSession: URLSession) async throws {
+        var components = URLComponents(url: mkdirEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "directory", value: parent),
+            URLQueryItem(name: "name", value: name)
+        ]
+        guard let url = components?.url else {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadURL,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not build mkdir URL."])
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        let (_, response) = try await urlSession.data(for: request)
+        if let http = response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            throw NSError(domain: NSURLErrorDomain,
+                          code: NSURLErrorBadServerResponse,
+                          userInfo: [NSLocalizedDescriptionKey: "Create directory failed with HTTP \(http.statusCode)."])
+        }
+    }
+
+    private nonisolated static func remoteChildPath(parent: String, name: String) -> String {
+        if parent == "/" {
+            return "/" + name
+        }
+        return parent + "/" + name
+    }
+
+    private func makeTextLayer(size: CGFloat,
+                               weight: NSFont.Weight,
+                               alignment: CATextLayerAlignmentMode = .left) -> CATextLayer {
+        let layer = CATextLayer()
+        layer.font = NSFont.systemFont(ofSize: size, weight: weight)
+        layer.fontSize = size
+        layer.contentsScale = 2
+        layer.truncationMode = .end
+        layer.alignmentMode = alignment
+        layer.foregroundColor = NSColor.labelColor.cgColor
+        return layer
+    }
+
+    private func folderIconCGImage(size: CGSize) -> CGImage? {
+        let image = NSWorkspace.shared.icon(for: UTType.folder).copy() as? NSImage
+            ?? NSWorkspace.shared.icon(for: UTType.folder)
+        image.size = size
+        var rect = NSRect(origin: .zero, size: size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    }
+
+    private func textWidth(_ text: String, fontSize: CGFloat, weight: NSFont.Weight) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: fontSize, weight: weight)
+        return ceil((text as NSString).size(withAttributes: [.font: font]).width)
+    }
+
+    private func alternatingRowColors() -> (even: CGColor, odd: CGColor) {
+        let alternating = NSColor.alternatingContentBackgroundColors
+        let evenColor = NSColor.clear.cgColor
+        let oddColor: CGColor
+        if alternating.count >= 2 {
+            oddColor = alternating[1].cgColor
+        } else if let first = alternating.first {
+            oddColor = first.cgColor
+        } else {
+            let background = NSColor.controlBackgroundColor
+            oddColor = (background.blended(withFraction: 0.08, of: NSColor.labelColor) ?? background).cgColor
+        }
+        return (even: evenColor, odd: oddColor)
+    }
+
+    private func formatModified(_ timestamp: Double) -> String {
+        let date = Date(timeIntervalSince1970: timestamp)
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private func formatByteCount(_ value: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file)
+    }
+}
+
+private func withoutImplicitAnimations(_ body: () -> Void) {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    body()
+    CATransaction.commit()
+}
