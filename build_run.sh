@@ -50,4 +50,4 @@ echo "  ${BUILD_ROOT}/${CONFIGURATION}/FilesBackend"
 echo "  ${RUN_ROOT}/bundles"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/FilesBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/FilesBackend\" --label dev.outergroup.Files --bundles-dir \"${RUN_ROOT}/bundles\" --icon-file \"${SCRIPT_DIR}/app-icon.png\""

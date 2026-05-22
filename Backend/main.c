@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -21,6 +22,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,7 +38,13 @@ static const char *kBundleFilePathMacosX86 = "bundles/FilesContent.bundle.macos-
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
+static char g_backend_label[256] = "dev.outergroup.Files";
+static char g_outerctl_path[PATH_MAX] = "";
+static char g_app_icon_path[PATH_MAX] = "";
+static char g_listen_socket_path[PATH_MAX] = "";
+static bool g_systemd_socket_activation = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
+static volatile sig_atomic_t g_listener_fd = -1;
 
 typedef struct {
     char *data;
@@ -55,6 +64,9 @@ typedef struct {
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
     g_shutdown_requested = 1;
+    if (g_listener_fd >= 0) {
+        close((int)g_listener_fd);
+    }
 }
 
 static void write_uint32_le(unsigned char *dst, uint32_t value) {
@@ -314,6 +326,102 @@ static const char *home_directory(void) {
     }
     struct passwd *pw = getpwuid(getuid());
     return pw ? pw->pw_dir : "/";
+}
+
+static bool mkdir_p(const char *path) {
+    char copy[PATH_MAX];
+    snprintf(copy, sizeof(copy), "%s", path);
+    size_t len = strlen(copy);
+    if (len == 0) return false;
+    for (char *p = copy + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(copy, 0755) != 0 && errno != EEXIST) return false;
+            *p = '/';
+        }
+    }
+    return mkdir(copy, 0755) == 0 || errno == EEXIST;
+}
+
+static void expand_tilde_path(const char *path, char *out, size_t out_size) {
+    if (!path || !path[0]) {
+        out[0] = '\0';
+    } else if (strcmp(path, "~") == 0) {
+        snprintf(out, out_size, "%s", home_directory());
+    } else if (path[0] == '~' && path[1] == '/') {
+        snprintf(out, out_size, "%s/%s", home_directory(), path + 2);
+    } else {
+        snprintf(out, out_size, "%s", path);
+    }
+}
+
+static void default_socket_path(char *out, size_t out_size) {
+    const char *label = g_backend_label[0] ? g_backend_label : "dev.outergroup.Files";
+#ifdef __APPLE__
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (runtime_dir && runtime_dir[0]) {
+        snprintf(out, out_size, "%s/%s", runtime_dir, label);
+    } else {
+        snprintf(out, out_size, "%s/Library/%s", home_directory(), label);
+    }
+#else
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (runtime_dir && runtime_dir[0]) {
+        snprintf(out, out_size, "%s/%s", runtime_dir, label);
+    } else {
+        snprintf(out, out_size, "/run/user/%d/%s", (int)getuid(), label);
+    }
+#endif
+}
+
+static void run_outerctl_announcement(const char *action, int port, const char *socket_path) {
+    if (!g_outerctl_path[0] || !g_backend_label[0]) return;
+
+    char port_buffer[16];
+    snprintf(port_buffer, sizeof(port_buffer), "%d", port);
+    pid_t child = fork();
+    if (child == 0) {
+        const char *arguments[24];
+        size_t argument_count = 0;
+        arguments[argument_count++] = g_outerctl_path;
+        arguments[argument_count++] = "app";
+        arguments[argument_count++] = action;
+        arguments[argument_count++] = "--backend";
+        arguments[argument_count++] = g_backend_label;
+        if (socket_path && socket_path[0]) {
+            arguments[argument_count++] = "--socket-path";
+            arguments[argument_count++] = socket_path;
+        } else if (port > 0) {
+            arguments[argument_count++] = "--port";
+            arguments[argument_count++] = port_buffer;
+        } else {
+            _exit(127);
+        }
+        if (strcmp(action, "add") == 0) {
+            arguments[argument_count++] = "--name";
+            arguments[argument_count++] = "Files";
+            arguments[argument_count++] = "--url";
+            arguments[argument_count++] = "/";
+            if (g_app_icon_path[0]) {
+                arguments[argument_count++] = "--icon-file";
+                arguments[argument_count++] = g_app_icon_path;
+            }
+        }
+        arguments[argument_count] = NULL;
+        execv(g_outerctl_path, (char *const *)arguments);
+        _exit(127);
+    }
+    if (child > 0) {
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }
+}
+
+static void cleanup_handler(void) {
+    if (g_listen_socket_path[0] && !g_systemd_socket_activation) {
+        run_outerctl_announcement("remove", 0, g_listen_socket_path);
+        unlink(g_listen_socket_path);
+    }
 }
 
 static void resolve_requested_path(const char *requested, char *resolved, size_t resolved_size) {
@@ -653,6 +761,15 @@ static void handle_client(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
+    struct pollfd poll_fd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int ready;
+    do {
+        ready = poll(&poll_fd, 1, 500);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0 || !(poll_fd.revents & POLLIN)) {
+        return;
+    }
+
     char request[READ_BUFFER_SIZE];
     ssize_t n = read(fd, request, sizeof(request) - 1);
     if (n <= 0) {
@@ -712,7 +829,7 @@ static void handle_client(int fd) {
     }
 }
 
-static int create_listener(int port) {
+static int create_tcp_listener(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
@@ -739,23 +856,117 @@ static int create_listener(int port) {
     return fd;
 }
 
+static int create_unix_listener(const char *socket_path) {
+    if (!socket_path || !socket_path[0]) {
+        fprintf(stderr, "socket path is required\n");
+        return -1;
+    }
+    if (strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        fprintf(stderr, "socket path is too long: %s\n", socket_path);
+        return -1;
+    }
+
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory), "%s", socket_path);
+    char *slash = strrchr(directory, '/');
+    if (slash) {
+        *slash = '\0';
+        if (!mkdir_p(directory)) {
+            fprintf(stderr, "failed to create socket directory %s: %s\n", directory, strerror(errno));
+            return -1;
+        }
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+    unlink(socket_path);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+    if (chmod(socket_path, 0600) != 0) {
+        perror("chmod");
+        close(fd);
+        unlink(socket_path);
+        return -1;
+    }
+    if (listen(fd, 64) != 0) {
+        perror("listen");
+        close(fd);
+        unlink(socket_path);
+        return -1;
+    }
+    snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
+    return fd;
+}
+
+static int systemd_activated_listener(void) {
+    const char *listen_pid = getenv("LISTEN_PID");
+    const char *listen_fds = getenv("LISTEN_FDS");
+    if (!listen_pid || !listen_fds) {
+        return -1;
+    }
+    char *end = NULL;
+    long pid = strtol(listen_pid, &end, 10);
+    if (!end || *end != '\0' || pid != (long)getpid()) {
+        return -1;
+    }
+    end = NULL;
+    long fds = strtol(listen_fds, &end, 10);
+    if (!end || *end != '\0' || fds < 1) {
+        return -1;
+    }
+    unsetenv("LISTEN_PID");
+    unsetenv("LISTEN_FDS");
+    unsetenv("LISTEN_FDNAMES");
+    g_systemd_socket_activation = true;
+    return 3;
+}
+
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT] [--bundles-dir DIR]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
+    bool use_port = false;
+    char socket_path[PATH_MAX] = "";
     const char *bundles_dir = "bundles";
+    const char *outerctl_path = getenv("OUTERCTL_PATH");
+    if (outerctl_path && outerctl_path[0]) {
+        snprintf(g_outerctl_path, sizeof(g_outerctl_path), "%s", outerctl_path);
+    }
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
+            use_port = true;
+            socket_path[0] = '\0';
+        } else if (strcmp(argv[i], "--socket-path") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], socket_path, sizeof(socket_path));
+            use_port = false;
+        } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
+            snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+        } else if (strcmp(argv[i], "--icon-file") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_app_icon_path, sizeof(g_app_icon_path));
         } else {
             usage(argv[0]);
             return 2;
         }
+    }
+    if (!use_port && !socket_path[0]) {
+        default_socket_path(socket_path, sizeof(socket_path));
     }
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
@@ -766,15 +977,42 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGPIPE, SIG_IGN);
+    atexit(cleanup_handler);
 
-    int listener = create_listener(port);
+    int listener = !use_port ? systemd_activated_listener() : -1;
+    if (listener < 0) {
+        listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
+    } else if (socket_path[0]) {
+        snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
+    }
     if (listener < 0) {
         return 1;
     }
-    fprintf(stderr, "FilesBackend listening on http://127.0.0.1:%d/\n", port);
+    g_listener_fd = listener;
+    if (use_port) {
+        fprintf(stderr, "FilesBackend listening on http://127.0.0.1:%d/\n", port);
+        run_outerctl_announcement("add", port, NULL);
+    } else {
+        fprintf(stderr, "FilesBackend listening on %s/\n", socket_path);
+        run_outerctl_announcement("add", 0, socket_path);
+    }
 
     while (!g_shutdown_requested) {
-        struct sockaddr_in peer;
+        if (g_systemd_socket_activation) {
+            struct pollfd poll_fd = {.fd = listener, .events = POLLIN};
+            int poll_result = poll(&poll_fd, 1, 60000);
+            if (poll_result == 0) {
+                break;
+            }
+            if (poll_result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("poll");
+                break;
+            }
+        }
+        struct sockaddr_storage peer;
         socklen_t peer_len = sizeof(peer);
         int client = accept(listener, (struct sockaddr *)&peer, &peer_len);
         if (client < 0) {
@@ -789,5 +1027,6 @@ int main(int argc, char **argv) {
     }
 
     close(listener);
+    g_listener_fd = -1;
     return 0;
 }
