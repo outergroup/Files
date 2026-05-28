@@ -807,8 +807,6 @@ static void send_app_announcement_to_outershelld(const char *action, int port, c
     if (strcmp(action, "add") == 0) {
         arguments[argument_count++] = "--name";
         arguments[argument_count++] = "Files";
-        arguments[argument_count++] = "--url";
-        arguments[argument_count++] = "/";
         if (g_app_icon_path[0]) {
             arguments[argument_count++] = "--icon-file";
             arguments[argument_count++] = g_app_icon_path;
