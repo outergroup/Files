@@ -916,6 +916,7 @@ enum ContentToBrowserMessage {
                                   deleteWhenDone: Bool,
                                   errorMessage: String?)
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
+    case navigate(url: String)
     case setEditingCapabilities(canCopy: Bool, canCut: Bool)
     case setPasteboardDropBehaviorUniform([String])
     case setAcceptedPasteboardPasteTypes([String])
@@ -1054,6 +1055,11 @@ enum ContentToBrowserMessage {
             payload.append(float64: preferredSize.map { Float64($0.width) } ?? 0)
             payload.append(float64: preferredSize.map { Float64($0.height) } ?? 0)
             return makeContentToBrowserFrame(type: .openNewWindow, payload: try payload.finalize())
+
+        case .navigate(let url):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: url)
+            return makeContentToBrowserFrame(type: .navigate, payload: try payload.finalize())
 
         case .setEditingCapabilities(let canCopy, let canCut):
             var payload = Data(capacity: 1)
@@ -1394,6 +1400,12 @@ enum ContentToBrowserMessage {
             let preferredSize = flags & (1 << 1) != 0 ? CGSize(width: width, height: height) : nil
             return .openNewWindow(url: url, displayString: displayString,
                                   preferredSize: preferredSize)
+
+        case .navigate:
+            guard let url = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .navigate(url: url)
         }
     }
 }
@@ -1559,6 +1571,7 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case setPasteboardDropBehaviorHitTest = 2024
     case releaseDroppedFileAccess = 2026
     case filePromiseWriteResponse = 2027
+    case navigate = 2028
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }

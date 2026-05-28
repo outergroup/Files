@@ -39,7 +39,7 @@ static const char *kBundleFilePathMacosX86 = "bundles/FilesContent.bundle.macos-
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_backend_label[256] = "dev.outergroup.Files";
-static char g_outerctl_path[PATH_MAX] = "";
+static char g_outershelld_api_socket_path[PATH_MAX] = "";
 static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
@@ -61,6 +61,9 @@ typedef struct {
     mode_t mode;
 } FileEntry;
 
+static bool query_value(const char *query, const char *name, char *dst, size_t dst_size);
+static void resolve_requested_path(const char *requested, char *resolved, size_t resolved_size);
+
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
     g_shutdown_requested = 1;
@@ -74,6 +77,11 @@ static void write_uint32_le(unsigned char *dst, uint32_t value) {
     dst[1] = (unsigned char)((value >> 8) & 0xffu);
     dst[2] = (unsigned char)((value >> 16) & 0xffu);
     dst[3] = (unsigned char)((value >> 24) & 0xffu);
+}
+
+static void write_uint16_le(unsigned char *dst, uint16_t value) {
+    dst[0] = (unsigned char)(value & 0xffu);
+    dst[1] = (unsigned char)((value >> 8) & 0xffu);
 }
 
 static void write_uint64_le(unsigned char *dst, uint64_t value) {
@@ -126,7 +134,7 @@ static void send_text_response(int fd, int status, const char *message) {
 }
 
 static void send_outer_descriptor(int fd) {
-    const char *plugin_json = "{\"filesAPIPath\":\"/api/files\",\"rootPath\":\"~\"}";
+    const char *plugin_json = "{\"filesAPIPath\":\"/api/files\",\"openersAPIPath\":\"/api/openers\",\"rootPath\":\"~\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_json);
     size_t header_len = 40;
@@ -227,43 +235,444 @@ static bool sb_append_n(StringBuilder *builder, const char *text, size_t length)
     return true;
 }
 
-static bool sb_append(StringBuilder *builder, const char *text) {
-    return sb_append_n(builder, text, strlen(text));
+static bool sb_append_u32_le(StringBuilder *builder, uint32_t value) {
+    char bytes[4] = {
+        (char)(value & 0xffu),
+        (char)((value >> 8) & 0xffu),
+        (char)((value >> 16) & 0xffu),
+        (char)((value >> 24) & 0xffu)
+    };
+    return sb_append_n(builder, bytes, sizeof(bytes));
 }
 
-static bool sb_append_json_string(StringBuilder *builder, const char *text) {
-    if (!sb_append(builder, "\"")) {
+static bool sb_append_u16_le(StringBuilder *builder, uint16_t value) {
+    char bytes[2] = {
+        (char)(value & 0xffu),
+        (char)((value >> 8) & 0xffu)
+    };
+    return sb_append_n(builder, bytes, sizeof(bytes));
+}
+
+static bool sb_append_u64_le(StringBuilder *builder, uint64_t value) {
+    char bytes[8];
+    for (int i = 0; i < 8; i++) {
+        bytes[i] = (char)((value >> (i * 8)) & 0xffu);
+    }
+    return sb_append_n(builder, bytes, sizeof(bytes));
+}
+
+static bool sb_append_zero(StringBuilder *builder, size_t length) {
+    if (!sb_reserve(builder, length)) {
         return false;
     }
-    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-        char escaped[8];
-        switch (*p) {
-        case '\\':
-            if (!sb_append(builder, "\\\\")) return false;
-            break;
-        case '"':
-            if (!sb_append(builder, "\\\"")) return false;
-            break;
-        case '\n':
-            if (!sb_append(builder, "\\n")) return false;
-            break;
-        case '\r':
-            if (!sb_append(builder, "\\r")) return false;
-            break;
-        case '\t':
-            if (!sb_append(builder, "\\t")) return false;
-            break;
-        default:
-            if (*p < 0x20) {
-                snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
-                if (!sb_append(builder, escaped)) return false;
-            } else if (!sb_append_n(builder, (const char *)p, 1)) {
-                return false;
-            }
-            break;
+    memset(builder->data + builder->length, 0, length);
+    builder->length += length;
+    builder->data[builder->length] = '\0';
+    return true;
+}
+
+static uint16_t read_u16_le_from_bytes(const unsigned char *data, size_t offset) {
+    return (uint16_t)(((uint16_t)data[offset]) | ((uint16_t)data[offset + 1] << 8));
+}
+
+static uint32_t read_u32_le_at(const char *data, size_t offset) {
+    const unsigned char *bytes = (const unsigned char *)(data + offset);
+    return ((uint32_t)bytes[0]) |
+           ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
+}
+
+static void write_u32_le_at(char *data, size_t offset, uint32_t value) {
+    data[offset] = (char)(value & 0xffu);
+    data[offset + 1] = (char)((value >> 8) & 0xffu);
+    data[offset + 2] = (char)((value >> 16) & 0xffu);
+    data[offset + 3] = (char)((value >> 24) & 0xffu);
+}
+
+static bool extension_for_path(const char *path, char *out, size_t out_size) {
+    if (!path || !path[0] || !out || out_size == 0) return false;
+    const char *basename = strrchr(path, '/');
+    basename = basename ? basename + 1 : path;
+    const char *dot = strrchr(basename, '.');
+    if (!dot || dot == basename || !dot[1]) return false;
+    size_t offset = 0;
+    for (const unsigned char *p = (const unsigned char *)(dot + 1); *p && offset + 1 < out_size; p++) {
+        out[offset++] = (char)tolower(*p);
+    }
+    if ((dot + 1)[offset] != '\0') return false;
+    out[offset] = '\0';
+    return offset > 0;
+}
+
+enum {
+    FILE_PATH_REQUEST_BINARY_MAGIC = 0x51465046u,
+    FILE_MKDIR_REQUEST_BINARY_MAGIC = 0x51444d46u,
+    FILE_LIST_BINARY_MAGIC = 0x534c4646u,
+    FILE_LIST_BINARY_VERSION = 1,
+    FILE_LIST_BINARY_HEADER_SIZE = 48,
+    FILE_LIST_BINARY_ROW_SIZE = 48,
+    FILE_OPENERS_BINARY_MAGIC = 0x504f464fu,
+    FILE_OPENERS_REQUEST_BINARY_MAGIC = 0x514f464fu,
+    FILE_OPENERS_BINARY_VERSION = 1,
+    FILE_OPENERS_BINARY_HEADER_SIZE = 32,
+    FILE_OPENERS_BINARY_ROW_SIZE = 40
+};
+
+enum {
+    OUTERSHELLD_API_OUTERCTL_INVOKE = 1,
+    OUTERSHELLD_API_OUTERCTL_INVOKE_RESPONSE = 2,
+    OUTERSHELLD_API_FILE_OPENERS_QUERY = 3,
+    OUTERSHELLD_API_FILE_OPENERS_RESPONSE = 4,
+    OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE = 18,
+    OUTERSHELLD_API_MAX_FRAME_SIZE = 1024 * 1024
+};
+
+static uint32_t read_u32_le_from_bytes(const unsigned char *data, size_t offset) {
+    return ((uint32_t)data[offset]) |
+           ((uint32_t)data[offset + 1] << 8) |
+           ((uint32_t)data[offset + 2] << 16) |
+           ((uint32_t)data[offset + 3] << 24);
+}
+
+static bool read_binary_string_ref(const unsigned char *data,
+                                   size_t data_len,
+                                   size_t ref_offset,
+                                   char *out,
+                                   size_t out_size) {
+    if (!data || !out || out_size == 0 || ref_offset + 8 > data_len) return false;
+    uint32_t string_offset = read_u32_le_from_bytes(data, ref_offset);
+    uint32_t string_length = read_u32_le_from_bytes(data, ref_offset + 4);
+    if ((size_t)string_offset > data_len || (size_t)string_length > data_len - (size_t)string_offset) return false;
+    size_t copy_length = string_length;
+    if (copy_length >= out_size) copy_length = out_size - 1;
+    memcpy(out, data + string_offset, copy_length);
+    out[copy_length] = '\0';
+    return copy_length == (size_t)string_length;
+}
+
+static bool read_binary_path_request(const unsigned char *body,
+                                     size_t body_len,
+                                     uint32_t magic,
+                                     char *path,
+                                     size_t path_size) {
+    if (!body || body_len < 16) return false;
+    if (read_u32_le_from_bytes(body, 0) != magic || read_u32_le_from_bytes(body, 4) != 1) return false;
+    return read_binary_string_ref(body, body_len, 8, path, path_size);
+}
+
+static bool read_binary_directory_name_request(const unsigned char *body,
+                                               size_t body_len,
+                                               uint32_t magic,
+                                               char *directory,
+                                               size_t directory_size,
+                                               char *name,
+                                               size_t name_size) {
+    if (!body || body_len < 24) return false;
+    if (read_u32_le_from_bytes(body, 0) != magic || read_u32_le_from_bytes(body, 4) != 1) return false;
+    return read_binary_string_ref(body, body_len, 8, directory, directory_size) &&
+           read_binary_string_ref(body, body_len, 16, name, name_size);
+}
+
+static bool read_binary_string_ref_view(const unsigned char *data,
+                                        size_t data_len,
+                                        size_t ref_offset,
+                                        const unsigned char **out,
+                                        size_t *out_len) {
+    if (out) *out = NULL;
+    if (out_len) *out_len = 0;
+    if (!data || ref_offset + 8 > data_len) return false;
+    uint32_t string_offset = read_u32_le_from_bytes(data, ref_offset);
+    uint32_t string_length = read_u32_le_from_bytes(data, ref_offset + 4);
+    if ((size_t)string_offset > data_len || (size_t)string_length > data_len - (size_t)string_offset) return false;
+    if (out) *out = data + string_offset;
+    if (out_len) *out_len = string_length;
+    return true;
+}
+
+static bool append_binary_string_ref(StringBuilder *rows,
+                                     StringBuilder *variable,
+                                     const char *text) {
+    size_t offset = variable->length;
+    size_t length = text ? strlen(text) : 0;
+    if (offset > UINT32_MAX || length > UINT32_MAX) {
+        return false;
+    }
+    return sb_append_u32_le(rows, (uint32_t)offset) &&
+           sb_append_u32_le(rows, (uint32_t)length) &&
+           sb_append_n(variable, text ? text : "", length);
+}
+
+static bool append_binary_data_ref(StringBuilder *rows,
+                                   StringBuilder *variable,
+                                   const unsigned char *data,
+                                   size_t length) {
+    size_t offset = variable->length;
+    if (offset > UINT32_MAX || length > UINT32_MAX) {
+        return false;
+    }
+    return sb_append_u32_le(rows, (uint32_t)offset) &&
+           sb_append_u32_le(rows, (uint32_t)length) &&
+           sb_append_n(variable, (const char *)(data ? data : (const unsigned char *)""), length);
+}
+
+static void patch_string_refs_to_absolute_offsets(char *data, size_t data_len, uint32_t variable_offset) {
+    for (size_t offset = 0; offset + 8 <= data_len; offset += 8) {
+        uint32_t relative = read_u32_le_at(data, offset);
+        write_u32_le_at(data, offset, relative + variable_offset);
+    }
+}
+
+static void patch_file_list_row_string_refs(char *data, size_t data_len, uint32_t variable_offset) {
+    for (size_t row_offset = 0; row_offset + FILE_LIST_BINARY_ROW_SIZE <= data_len; row_offset += FILE_LIST_BINARY_ROW_SIZE) {
+        for (size_t field_offset = 0; field_offset < 24; field_offset += 8) {
+            uint32_t relative = read_u32_le_at(data, row_offset + field_offset);
+            write_u32_le_at(data, row_offset + field_offset, relative + variable_offset);
         }
     }
-    return sb_append(builder, "\"");
+}
+
+static void default_outershelld_api_socket_path(char *out, size_t out_size) {
+    const char *env_path = getenv("OUTERSHELLD_API_SOCKET");
+    if (env_path && env_path[0]) {
+        snprintf(out, out_size, "%s", env_path);
+        return;
+    }
+#ifdef __APPLE__
+    const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
+    if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
+    if (tmp && tmp[0]) {
+        snprintf(out, out_size, "%s%soutershelld-api", tmp, tmp[strlen(tmp) - 1] == '/' ? "" : "/");
+        return;
+    }
+    snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
+#else
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime && runtime[0]) {
+        snprintf(out, out_size, "%s/outershelld-api", runtime);
+        return;
+    }
+    snprintf(out, out_size, "/run/user/%d/outershelld-api", (int)getuid());
+#endif
+}
+
+static bool write_exact_fd(int fd, const void *data, size_t length) {
+    const char *bytes = data;
+    while (length > 0) {
+        ssize_t written = write(fd, bytes, length);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (written == 0) return false;
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return true;
+}
+
+static bool read_exact_fd(int fd, void *data, size_t length) {
+    char *bytes = data;
+    while (length > 0) {
+        ssize_t got = read(fd, bytes, length);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (got == 0) return false;
+        bytes += got;
+        length -= (size_t)got;
+    }
+    return true;
+}
+
+static int connect_outershelld_api_socket(void) {
+    if (!g_outershelld_api_socket_path[0]) return -1;
+    if (strlen(g_outershelld_api_socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", g_outershelld_api_socket_path);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool api_message_append_string_ref_at(StringBuilder *message, size_t ref_offset, const char *text) {
+    const char *safe_text = text ? text : "";
+    size_t offset = message->length;
+    size_t length = strlen(safe_text);
+    if (offset > UINT32_MAX || length > UINT32_MAX || ref_offset + 8 > message->length) return false;
+    if (!sb_append_n(message, safe_text, length)) return false;
+    write_u32_le_at(message->data, ref_offset, (uint32_t)offset);
+    write_u32_le_at(message->data, ref_offset + 4, (uint32_t)length);
+    return true;
+}
+
+static bool send_outershelld_api_message(StringBuilder *message, StringBuilder *response) {
+    if (!message || message->length > UINT32_MAX || !response) return false;
+    int fd = connect_outershelld_api_socket();
+    if (fd < 0) return false;
+
+    unsigned char prefix[4];
+    write_uint32_le(prefix, (uint32_t)message->length);
+    bool ok = write_exact_fd(fd, prefix, sizeof(prefix)) &&
+              write_exact_fd(fd, message->data, message->length);
+    if (ok) {
+        unsigned char response_length_bytes[4];
+        ok = read_exact_fd(fd, response_length_bytes, sizeof(response_length_bytes));
+        if (ok) {
+            uint32_t response_length = read_u32_le_from_bytes(response_length_bytes, 0);
+            ok = response_length <= OUTERSHELLD_API_MAX_FRAME_SIZE &&
+                 sb_reserve(response, response_length) &&
+                 read_exact_fd(fd, response->data, response_length);
+            if (ok) {
+                response->length = response_length;
+                response->data[response->length] = '\0';
+            }
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+static bool send_outerctl_invoke_to_outershelld(const char *const *arguments, size_t argument_count) {
+    if (!arguments || argument_count > 256) return false;
+    size_t fixed_size = 14 + argument_count * 8;
+    StringBuilder message = {0};
+    StringBuilder response = {0};
+    bool ok = sb_append_zero(&message, fixed_size) &&
+              (write_uint16_le((unsigned char *)message.data, OUTERSHELLD_API_OUTERCTL_INVOKE), true) &&
+              (write_u32_le_at(message.data, 2, (uint32_t)argument_count), true) &&
+              api_message_append_string_ref_at(&message, 6, "");
+    for (size_t i = 0; ok && i < argument_count; i++) {
+        ok = api_message_append_string_ref_at(&message, 14 + i * 8, arguments[i]);
+    }
+    ok = ok && send_outershelld_api_message(&message, &response);
+    if (ok) {
+        ok = response.length >= 6 &&
+             read_u16_le_from_bytes((const unsigned char *)response.data, 0) == OUTERSHELLD_API_OUTERCTL_INVOKE_RESPONSE &&
+             read_u32_le_from_bytes((const unsigned char *)response.data, 2) == 0;
+    }
+    free(message.data);
+    free(response.data);
+    return ok;
+}
+
+static bool query_file_openers_from_outershelld(const char *extension,
+                                                const char *path,
+                                                StringBuilder *response) {
+    StringBuilder message = {0};
+    bool ok = sb_append_u16_le(&message, OUTERSHELLD_API_FILE_OPENERS_QUERY) &&
+              sb_append_zero(&message, 16) &&
+              api_message_append_string_ref_at(&message, 2, extension) &&
+              api_message_append_string_ref_at(&message, 10, path);
+    ok = ok && send_outershelld_api_message(&message, response);
+    free(message.data);
+    return ok;
+}
+
+static void send_empty_openers_response(int fd) {
+    char header[FILE_OPENERS_BINARY_HEADER_SIZE];
+    memset(header, 0, sizeof(header));
+    write_u32_le_at(header, 0, FILE_OPENERS_BINARY_MAGIC);
+    write_u32_le_at(header, 4, FILE_OPENERS_BINARY_VERSION);
+    write_u32_le_at(header, 12, FILE_OPENERS_BINARY_ROW_SIZE);
+    write_u32_le_at(header, 16, FILE_OPENERS_BINARY_HEADER_SIZE);
+    write_u32_le_at(header, 20, FILE_OPENERS_BINARY_HEADER_SIZE);
+    write_u32_le_at(header, 24, FILE_OPENERS_BINARY_HEADER_SIZE);
+    send_response(fd, 200, "OK", "application/octet-stream", header, sizeof(header));
+}
+
+static void send_openers_response_for_path(int fd, const char *requested) {
+    char path[PATH_MAX];
+    char extension[128];
+    resolve_requested_path(requested, path, sizeof(path));
+    if (!extension_for_path(path, extension, sizeof(extension)) || !g_outershelld_api_socket_path[0]) {
+        send_empty_openers_response(fd);
+        return;
+    }
+
+    StringBuilder api_response = {0};
+    if (!query_file_openers_from_outershelld(extension, path, &api_response) ||
+        api_response.length < OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE ||
+        read_u16_le_from_bytes((const unsigned char *)api_response.data, 0) != OUTERSHELLD_API_FILE_OPENERS_RESPONSE ||
+        read_u32_le_from_bytes((const unsigned char *)api_response.data, 2) != 0) {
+        free(api_response.data);
+        send_empty_openers_response(fd);
+        return;
+    }
+
+    uint32_t api_row_count = read_u32_le_from_bytes((const unsigned char *)api_response.data, 14);
+    if (api_row_count > (api_response.length - OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE) / FILE_OPENERS_BINARY_ROW_SIZE) {
+        free(api_response.data);
+        send_empty_openers_response(fd);
+        return;
+    }
+
+    StringBuilder rows = {0};
+    StringBuilder variable = {0};
+    uint32_t row_count = 0;
+    bool ok = true;
+    const unsigned char *api_bytes = (const unsigned char *)api_response.data;
+    for (uint32_t i = 0; ok && i < api_row_count; i++) {
+        size_t api_row_offset = OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE + (size_t)i * FILE_OPENERS_BINARY_ROW_SIZE;
+        for (size_t field_offset = 0; ok && field_offset < FILE_OPENERS_BINARY_ROW_SIZE; field_offset += 8) {
+            const unsigned char *value = NULL;
+            size_t value_length = 0;
+            ok = read_binary_string_ref_view(api_bytes, api_response.length, api_row_offset + field_offset, &value, &value_length) &&
+                 append_binary_data_ref(&rows, &variable, value, value_length);
+        }
+        if (ok) row_count++;
+    }
+    free(api_response.data);
+
+    size_t variable_offset = FILE_OPENERS_BINARY_HEADER_SIZE + rows.length;
+    size_t total_size = variable_offset + variable.length;
+    if (!ok || rows.length > UINT32_MAX || variable.length > UINT32_MAX ||
+        variable_offset > UINT32_MAX || total_size > UINT32_MAX) {
+        free(rows.data);
+        free(variable.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+
+    patch_string_refs_to_absolute_offsets(rows.data, rows.length, (uint32_t)variable_offset);
+
+    StringBuilder response = {0};
+    ok = sb_append_u32_le(&response, FILE_OPENERS_BINARY_MAGIC) &&
+         sb_append_u32_le(&response, FILE_OPENERS_BINARY_VERSION) &&
+         sb_append_u32_le(&response, row_count) &&
+         sb_append_u32_le(&response, FILE_OPENERS_BINARY_ROW_SIZE) &&
+         sb_append_u32_le(&response, FILE_OPENERS_BINARY_HEADER_SIZE) &&
+         sb_append_u32_le(&response, (uint32_t)variable_offset) &&
+         sb_append_u32_le(&response, (uint32_t)total_size) &&
+         sb_append_u32_le(&response, 0) &&
+         sb_append_n(&response, rows.data ? rows.data : "", rows.length) &&
+         sb_append_n(&response, variable.data ? variable.data : "", variable.length);
+    free(rows.data);
+    free(variable.data);
+
+    if (!ok) {
+        free(response.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/octet-stream", response.data, response.length);
+    free(response.data);
+}
+
+static void send_openers_response(int fd, const char *query) {
+    char requested[PATH_MAX];
+    if (!query_value(query, "path", requested, sizeof(requested))) {
+        send_text_response(fd, 400, "missing path\n");
+        return;
+    }
+    send_openers_response_for_path(fd, requested);
 }
 
 static int hex_value(char c) {
@@ -374,52 +783,43 @@ static void default_socket_path(char *out, size_t out_size) {
 #endif
 }
 
-static void run_outerctl_announcement(const char *action, int port, const char *socket_path) {
-    if (!g_outerctl_path[0] || !g_backend_label[0]) return;
+static void send_app_announcement_to_outershelld(const char *action, int port, const char *socket_path) {
+    if (!g_outershelld_api_socket_path[0] || !g_backend_label[0]) return;
 
     char port_buffer[16];
     snprintf(port_buffer, sizeof(port_buffer), "%d", port);
-    pid_t child = fork();
-    if (child == 0) {
-        const char *arguments[24];
-        size_t argument_count = 0;
-        arguments[argument_count++] = g_outerctl_path;
-        arguments[argument_count++] = "app";
-        arguments[argument_count++] = action;
-        arguments[argument_count++] = "--backend";
-        arguments[argument_count++] = g_backend_label;
-        if (socket_path && socket_path[0]) {
-            arguments[argument_count++] = "--socket-path";
-            arguments[argument_count++] = socket_path;
-        } else if (port > 0) {
-            arguments[argument_count++] = "--port";
-            arguments[argument_count++] = port_buffer;
-        } else {
-            _exit(127);
-        }
-        if (strcmp(action, "add") == 0) {
-            arguments[argument_count++] = "--name";
-            arguments[argument_count++] = "Files";
-            arguments[argument_count++] = "--url";
-            arguments[argument_count++] = "/";
-            if (g_app_icon_path[0]) {
-                arguments[argument_count++] = "--icon-file";
-                arguments[argument_count++] = g_app_icon_path;
-            }
-        }
-        arguments[argument_count] = NULL;
-        execv(g_outerctl_path, (char *const *)arguments);
-        _exit(127);
+    const char *arguments[24];
+    size_t argument_count = 0;
+    arguments[argument_count++] = "outerctl";
+    arguments[argument_count++] = "app";
+    arguments[argument_count++] = action;
+    arguments[argument_count++] = "--backend";
+    arguments[argument_count++] = g_backend_label;
+    if (socket_path && socket_path[0]) {
+        arguments[argument_count++] = "--socket-path";
+        arguments[argument_count++] = socket_path;
+    } else if (port > 0) {
+        arguments[argument_count++] = "--port";
+        arguments[argument_count++] = port_buffer;
+    } else {
+        return;
     }
-    if (child > 0) {
-        int status = 0;
-        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    if (strcmp(action, "add") == 0) {
+        arguments[argument_count++] = "--name";
+        arguments[argument_count++] = "Files";
+        arguments[argument_count++] = "--url";
+        arguments[argument_count++] = "/";
+        if (g_app_icon_path[0]) {
+            arguments[argument_count++] = "--icon-file";
+            arguments[argument_count++] = g_app_icon_path;
+        }
     }
+    send_outerctl_invoke_to_outershelld(arguments, argument_count);
 }
 
 static void cleanup_handler(void) {
     if (g_listen_socket_path[0] && !g_systemd_socket_activation) {
-        run_outerctl_announcement("remove", 0, g_listen_socket_path);
+        send_app_announcement_to_outershelld("remove", 0, g_listen_socket_path);
         unlink(g_listen_socket_path);
     }
 }
@@ -484,32 +884,23 @@ static int compare_entries(const void *lhs, const void *rhs) {
     return strcasecmp(a->name, b->name);
 }
 
-static bool append_entry_json(StringBuilder *builder, const FileEntry *entry) {
-    char number[64];
+static bool append_file_list_entry_row(StringBuilder *rows,
+                                       StringBuilder *variable,
+                                       const FileEntry *entry) {
     char mode[11];
     mode_string(entry->mode, mode);
-
-    if (!sb_append(builder, "{\"name\":")) return false;
-    if (!sb_append_json_string(builder, entry->name)) return false;
-    if (!sb_append(builder, ",\"path\":")) return false;
-    if (!sb_append_json_string(builder, entry->path)) return false;
-    if (!sb_append(builder, ",\"isDirectory\":")) return false;
-    if (!sb_append(builder, entry->is_directory ? "true" : "false")) return false;
-    snprintf(number, sizeof(number), ",\"size\":%llu", (unsigned long long)entry->size);
-    if (!sb_append(builder, number)) return false;
-    snprintf(number, sizeof(number), ",\"modified\":%.3f", entry->modified);
-    if (!sb_append(builder, number)) return false;
-    if (!sb_append(builder, ",\"mode\":")) return false;
-    if (!sb_append_json_string(builder, mode)) return false;
-    return sb_append(builder, "}");
+    uint64_t modified_millis = entry->modified > 0 ? (uint64_t)(entry->modified * 1000.0) : 0;
+    return append_binary_string_ref(rows, variable, entry->name) &&
+           append_binary_string_ref(rows, variable, entry->path) &&
+           append_binary_string_ref(rows, variable, mode) &&
+           sb_append_u32_le(rows, entry->is_directory ? 1u : 0u) &&
+           sb_append_u32_le(rows, 0) &&
+           sb_append_u64_le(rows, entry->size) &&
+           sb_append_u64_le(rows, modified_millis);
 }
 
-static void send_files_response(int fd, const char *query) {
-    char requested[PATH_MAX];
+static void send_files_response_for_path(int fd, const char *requested) {
     char path[PATH_MAX];
-    if (!query_value(query, "path", requested, sizeof(requested))) {
-        requested[0] = '\0';
-    }
     resolve_requested_path(requested, path, sizeof(path));
 
     DIR *dir = opendir(path);
@@ -565,30 +956,64 @@ static void send_files_response(int fd, const char *query) {
     char parent[PATH_MAX];
     parent_path_for(path, parent, sizeof(parent));
 
-    StringBuilder builder = {0};
-    bool ok = sb_append(&builder, "{\"path\":") &&
-              sb_append_json_string(&builder, path) &&
-              sb_append(&builder, ",\"parent\":") &&
-              sb_append_json_string(&builder, parent) &&
-              sb_append(&builder, ",\"entries\":[");
+    StringBuilder header_refs = {0};
+    StringBuilder rows = {0};
+    StringBuilder variable = {0};
+    bool ok = append_binary_string_ref(&header_refs, &variable, path) &&
+              append_binary_string_ref(&header_refs, &variable, parent);
     for (size_t i = 0; ok && i < count; i++) {
-        if (i > 0) {
-            ok = sb_append(&builder, ",");
-        }
-        if (ok) {
-            ok = append_entry_json(&builder, &entries[i]);
-        }
+        ok = append_file_list_entry_row(&rows, &variable, &entries[i]);
     }
-    ok = ok && sb_append(&builder, "]}");
     free(entries);
 
+    size_t variable_offset = FILE_LIST_BINARY_HEADER_SIZE + rows.length;
+    size_t total_size = variable_offset + variable.length;
+    if (ok && (header_refs.length != 16 || rows.length > UINT32_MAX || variable.length > UINT32_MAX ||
+               variable_offset > UINT32_MAX || total_size > UINT32_MAX || count > UINT32_MAX)) {
+        ok = false;
+    }
     if (!ok) {
-        free(builder.data);
+        free(header_refs.data);
+        free(rows.data);
+        free(variable.data);
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
-    free(builder.data);
+
+    patch_string_refs_to_absolute_offsets(header_refs.data, header_refs.length, (uint32_t)variable_offset);
+    patch_file_list_row_string_refs(rows.data, rows.length, (uint32_t)variable_offset);
+
+    StringBuilder response = {0};
+    ok = sb_append_u32_le(&response, FILE_LIST_BINARY_MAGIC) &&
+         sb_append_u32_le(&response, FILE_LIST_BINARY_VERSION) &&
+         sb_append_u32_le(&response, (uint32_t)count) &&
+         sb_append_u32_le(&response, FILE_LIST_BINARY_ROW_SIZE) &&
+         sb_append_u32_le(&response, FILE_LIST_BINARY_HEADER_SIZE) &&
+         sb_append_u32_le(&response, (uint32_t)variable_offset) &&
+         sb_append_u32_le(&response, (uint32_t)total_size) &&
+         sb_append_u32_le(&response, 0) &&
+         sb_append_n(&response, header_refs.data, header_refs.length) &&
+         sb_append_n(&response, rows.data ? rows.data : "", rows.length) &&
+         sb_append_n(&response, variable.data ? variable.data : "", variable.length);
+    free(header_refs.data);
+    free(rows.data);
+    free(variable.data);
+
+    if (!ok) {
+        free(response.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/octet-stream", response.data, response.length);
+    free(response.data);
+}
+
+static void send_files_response(int fd, const char *query) {
+    char requested[PATH_MAX];
+    if (!query_value(query, "path", requested, sizeof(requested))) {
+        requested[0] = '\0';
+    }
+    send_files_response_for_path(fd, requested);
 }
 
 static void send_download_response(int fd, const char *query) {
@@ -663,17 +1088,10 @@ static void send_upload_response(int fd, const char *query, const unsigned char 
     send_text_response(fd, 200, "ok\n");
 }
 
-static void send_mkdir_response(int fd, const char *query) {
-    char requested_directory[PATH_MAX];
+static void send_mkdir_response_for_inputs(int fd, const char *requested_directory, const char *name) {
     char directory[PATH_MAX];
-    char name[NAME_MAX + 1];
     char output_path[PATH_MAX];
 
-    if (!query_value(query, "directory", requested_directory, sizeof(requested_directory)) ||
-        !query_value(query, "name", name, sizeof(name))) {
-        send_text_response(fd, 400, "missing directory or name\n");
-        return;
-    }
     if (!safe_upload_name(name)) {
         send_text_response(fd, 400, "invalid directory name\n");
         return;
@@ -699,6 +1117,18 @@ static void send_mkdir_response(int fd, const char *query) {
         return;
     }
     send_text_response(fd, 200, "ok\n");
+}
+
+static void send_mkdir_response(int fd, const char *query) {
+    char requested_directory[PATH_MAX];
+    char name[NAME_MAX + 1];
+
+    if (!query_value(query, "directory", requested_directory, sizeof(requested_directory)) ||
+        !query_value(query, "name", name, sizeof(name))) {
+        send_text_response(fd, 400, "missing directory or name\n");
+        return;
+    }
+    send_mkdir_response_for_inputs(fd, requested_directory, name);
 }
 
 static size_t request_content_length(const char *request) {
@@ -794,18 +1224,50 @@ static void handle_client(int fd) {
     }
 
     if (strcasecmp(method, "POST") == 0) {
-        if (strcmp(target, "/api/mkdir") == 0) {
-            send_mkdir_response(fd, query);
-            return;
-        }
-        if (strcmp(target, "/api/upload") != 0) {
-            send_text_response(fd, 404, "not found\n");
-            return;
-        }
         size_t content_length = request_content_length(request);
         unsigned char *body = read_request_body(fd, request, n, content_length);
         if (!body && content_length > 0) {
             send_text_response(fd, 400, "failed to read request body\n");
+            return;
+        }
+        if (strcmp(target, "/api/files") == 0) {
+            char requested[PATH_MAX];
+            if (!read_binary_path_request(body, content_length, FILE_PATH_REQUEST_BINARY_MAGIC, requested, sizeof(requested))) {
+                free(body);
+                send_text_response(fd, 400, "bad files request\n");
+                return;
+            }
+            send_files_response_for_path(fd, requested);
+            free(body);
+            return;
+        }
+        if (strcmp(target, "/api/openers") == 0) {
+            char requested[PATH_MAX];
+            if (!read_binary_path_request(body, content_length, FILE_OPENERS_REQUEST_BINARY_MAGIC, requested, sizeof(requested))) {
+                free(body);
+                send_text_response(fd, 400, "bad openers request\n");
+                return;
+            }
+            send_openers_response_for_path(fd, requested);
+            free(body);
+            return;
+        }
+        if (strcmp(target, "/api/mkdir") == 0) {
+            char requested_directory[PATH_MAX];
+            char name[NAME_MAX + 1];
+            if (read_binary_directory_name_request(body, content_length, FILE_MKDIR_REQUEST_BINARY_MAGIC,
+                                                   requested_directory, sizeof(requested_directory),
+                                                   name, sizeof(name))) {
+                send_mkdir_response_for_inputs(fd, requested_directory, name);
+            } else {
+                send_mkdir_response(fd, query);
+            }
+            free(body);
+            return;
+        }
+        if (strcmp(target, "/api/upload") != 0) {
+            free(body);
+            send_text_response(fd, 404, "not found\n");
             return;
         }
         send_upload_response(fd, query, body, content_length);
@@ -822,6 +1284,8 @@ static void handle_client(int fd) {
         send_bundle_file(fd, path);
     } else if (strcmp(target, "/api/files") == 0) {
         send_files_response(fd, query);
+    } else if (strcmp(target, "/api/openers") == 0) {
+        send_openers_response(fd, query);
     } else if (strcmp(target, "/api/download") == 0) {
         send_download_response(fd, query);
     } else {
@@ -933,7 +1397,7 @@ static int systemd_activated_listener(void) {
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -941,10 +1405,7 @@ int main(int argc, char **argv) {
     bool use_port = false;
     char socket_path[PATH_MAX] = "";
     const char *bundles_dir = "bundles";
-    const char *outerctl_path = getenv("OUTERCTL_PATH");
-    if (outerctl_path && outerctl_path[0]) {
-        snprintf(g_outerctl_path, sizeof(g_outerctl_path), "%s", outerctl_path);
-    }
+    default_outershelld_api_socket_path(g_outershelld_api_socket_path, sizeof(g_outershelld_api_socket_path));
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -954,6 +1415,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--socket-path") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], socket_path, sizeof(socket_path));
             use_port = false;
+        } else if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_outershelld_api_socket_path, sizeof(g_outershelld_api_socket_path));
         } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
@@ -991,10 +1454,10 @@ int main(int argc, char **argv) {
     g_listener_fd = listener;
     if (use_port) {
         fprintf(stderr, "FilesBackend listening on http://127.0.0.1:%d/\n", port);
-        run_outerctl_announcement("add", port, NULL);
+        send_app_announcement_to_outershelld("add", port, NULL);
     } else {
         fprintf(stderr, "FilesBackend listening on %s/\n", socket_path);
-        run_outerctl_announcement("add", 0, socket_path);
+        send_app_announcement_to_outershelld("add", 0, socket_path);
     }
 
     while (!g_shutdown_requested) {

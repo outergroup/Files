@@ -424,6 +424,12 @@ final class OuterframeHost: SocketToBrowserDelegate {
         }
     }
 
+    func navigate(to url: URL) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.navigate(url: url.absoluteString).encode())
+        }
+    }
+
     @discardableResult
     func pushHistoryEntry(url: URL?) -> UUID {
         let entryID = UUID()

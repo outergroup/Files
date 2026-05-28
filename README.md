@@ -38,7 +38,7 @@ You can also pass an explicit socket:
   --bundles-dir ./build/run/bundles
 ```
 
-The backend serves the outerframe descriptor, the archived macOS content bundles, and `/api/files?path=...` from the same loopback HTTP server.
+The backend serves the outerframe descriptor, the archived macOS content bundles, `/api/files?path=...`, and `/api/openers?path=...` from the same loopback HTTP server. Files queries outershelld's socket API directly for opener registry entries, using `OUTERSHELLD_API_SOCKET` when set or the platform default API socket path otherwise.
 
 To create a release payload for a Home Screen-style installer, build both Linux
 backend architectures into `build/linux-package/RemoteLinuxBinaries`, then run:

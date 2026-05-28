@@ -17,19 +17,52 @@ import UniformTypeIdentifiers
     }
 }
 
-private struct FileListResponse: Decodable, Sendable {
+private struct FileListResponse: Sendable {
     let path: String
     let parent: String?
     let entries: [FileEntry]
 }
 
-private struct FileEntry: Decodable, Sendable {
+private struct FileEntry: Sendable {
     let name: String
     let path: String
     let isDirectory: Bool
     let size: UInt64
     let modified: Double
     let mode: String
+}
+
+private struct FileOpener: Sendable {
+    let extensionName: String
+    let serviceID: String
+    let displayName: String
+    let socketPath: String
+    let url: String
+}
+
+private enum FileOpenersBinaryFormat {
+    static let magic: UInt32 = 0x504f464f
+    static let requestMagic: UInt32 = 0x514f464f
+    static let version: UInt32 = 1
+    static let headerSize = 32
+    static let rowSize = 40
+}
+
+private enum FilePathRequestBinaryFormat {
+    static let magic: UInt32 = 0x51465046
+    static let version: UInt32 = 1
+}
+
+private enum FileMkdirRequestBinaryFormat {
+    static let magic: UInt32 = 0x51444d46
+    static let version: UInt32 = 1
+}
+
+private enum FileListBinaryFormat {
+    static let magic: UInt32 = 0x534c4646
+    static let version: UInt32 = 1
+    static let headerSize = 48
+    static let rowSize = 48
 }
 
 private struct BreadcrumbSegment {
@@ -151,8 +184,9 @@ private struct BinaryPayloadCursor {
     private let data: Data
     private var offset = 0
 
-    init(_ data: Data) {
+    init(_ data: Data, offset: Int = 0) {
         self.data = data
+        self.offset = offset
     }
 
     mutating func readUInt32() -> UInt32? {
@@ -241,6 +275,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var currentSize = CGSize(width: 900, height: 600)
     private var urlSession: URLSession?
     private var filesEndpoint: URL?
+    private var openersEndpoint: URL?
     private var downloadEndpoint: URL?
     private var uploadEndpoint: URL?
     private var mkdirEndpoint: URL?
@@ -262,6 +297,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var favoriteFrames: [(frame: CGRect, path: String)] = []
     private var breadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
     private var pendingFavoriteMenuEntries: [UUID: FileEntry] = [:]
+    private var pendingOpenMenuEntries: [UUID: (entry: FileEntry, openers: [FileOpener])] = [:]
 
     private let favoritesBarHeight: CGFloat = 36
     private let breadcrumbBarHeight: CGFloat = 34
@@ -373,6 +409,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func configureNetworking() {
         if let base = outerframeHost.pluginBaseURL() {
             filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
+            openersEndpoint = URL(string: "/api/openers", relativeTo: base)?.absoluteURL
             downloadEndpoint = URL(string: "/api/download", relativeTo: base)?.absoluteURL
             uploadEndpoint = URL(string: "/api/upload", relativeTo: base)?.absoluteURL
             mkdirEndpoint = URL(string: "/api/mkdir", relativeTo: base)?.absoluteURL
@@ -632,16 +669,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         shouldReplaceHistoryEntryAfterLoad = replaceHistoryEntryAfterLoad
         statusLayer.string = "Loading..."
 
-        var components = URLComponents(url: filesEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "path", value: path)]
-        guard let url = components?.url else {
+        guard let request = Self.binaryPathRequest(url: filesEndpoint,
+                                                   magic: FilePathRequestBinaryFormat.magic,
+                                                   path: path) else {
             isLoading = false
             shouldReplaceHistoryEntryAfterLoad = false
             statusLayer.string = "Could not build file request"
             return
         }
 
-        urlSession?.dataTask(with: url) { [weak self] data, _, error in
+        urlSession?.dataTask(with: request) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
                 self.isLoading = false
@@ -656,7 +693,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     return
                 }
                 do {
-                    let response = try JSONDecoder().decode(FileListResponse.self, from: data)
+                    let response = try Self.decodeFileList(data)
                     self.currentPath = response.path
                     if self.homePath == nil {
                         self.homePath = Self.inferHomePath(from: response.path) ?? (path == "~" ? response.path : nil)
@@ -793,10 +830,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         updatePasteboardCapabilities()
         updateFavoritesBar()
 
-        if clickCount >= 2, entries[index].isDirectory {
+        if clickCount >= 2 {
             dragCandidateIndex = nil
             dragStartPoint = nil
-            openDirectory(path: entries[index].path)
+            let entry = entries[index]
+            if entry.isDirectory {
+                openDirectory(path: entry.path)
+            } else {
+                openFileWithDefaultOpener(entry)
+            }
         }
     }
 
@@ -991,13 +1033,28 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             selectedIndex = index
             updateRows()
             updatePasteboardCapabilities()
-            outerframeHost.showContextMenu(menuID: UUID(),
-                                           items: [
-                                            OuterframeContextMenuItem(id: "copy",
-                                                                      title: "Copy",
-                                                                      action: .standardCopy)
-                                           ],
-                                           at: point)
+            let entry = entries[index]
+            fetchOpeners(for: entry) { [weak self] openers in
+                guard let self else { return }
+                let menuID = UUID()
+                var items = [
+                    OuterframeContextMenuItem(id: "copy",
+                                              title: "Copy",
+                                              action: .standardCopy)
+                ]
+                if !openers.isEmpty {
+                    self.pendingOpenMenuEntries[menuID] = (entry, openers)
+                    for (index, opener) in openers.enumerated() {
+                        let title = opener.displayName.isEmpty ? opener.serviceID : opener.displayName
+                        items.append(OuterframeContextMenuItem(id: "open-\(index)",
+                                                               title: "Open in \(title)",
+                                                               isEnabled: true))
+                    }
+                }
+                self.outerframeHost.showContextMenu(menuID: menuID,
+                                                    items: items,
+                                                    at: point)
+            }
             return
         }
 
@@ -1011,11 +1068,267 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleContextMenuItemSelected(menuID: UUID, itemID: String) {
+        if let pending = pendingOpenMenuEntries.removeValue(forKey: menuID),
+           itemID.hasPrefix("open-"),
+           let index = Int(itemID.dropFirst("open-".count)),
+           pending.openers.indices.contains(index) {
+            openFile(entry: pending.entry, with: pending.openers[index])
+            return
+        }
+
         guard itemID == "add-to-favorites",
               let entry = pendingFavoriteMenuEntries.removeValue(forKey: menuID) else {
             return
         }
         addFavorite(entry)
+    }
+
+    private func openFileWithDefaultOpener(_ entry: FileEntry) {
+        guard !entry.isDirectory else { return }
+        statusLayer.string = ""
+        fetchOpeners(for: entry) { [weak self] openers in
+            guard let self else { return }
+            guard let opener = openers.first else {
+                self.statusLayer.string = "No app found for \(entry.name)"
+                return
+            }
+            self.navigateToFile(entry: entry, with: opener)
+        }
+    }
+
+    private func navigateToFile(entry: FileEntry, with opener: FileOpener) {
+        guard !entry.isDirectory,
+              let url = openerNavigationURL(opener) else {
+            statusLayer.string = "Could not open \(entry.name)"
+            return
+        }
+        statusLayer.string = ""
+        outerframeHost.navigate(to: url)
+    }
+
+    private func openFile(entry: FileEntry, with opener: FileOpener) {
+        guard !entry.isDirectory,
+              let url = openerNavigationURL(opener) else {
+            statusLayer.string = "Could not open \(entry.name)"
+            return
+        }
+        let title = opener.displayName.isEmpty ? opener.serviceID : opener.displayName
+        statusLayer.string = ""
+        outerframeHost.openNewWindow(with: url,
+                                     displayString: title,
+                                     preferredSize: CGSize(width: 900, height: 650))
+    }
+
+    private func fetchOpeners(for entry: FileEntry, completion: @escaping @MainActor ([FileOpener]) -> Void) {
+        guard !entry.isDirectory,
+              let openersEndpoint,
+              let urlSession else {
+            completion([])
+            return
+        }
+        guard let request = Self.binaryPathRequest(url: openersEndpoint,
+                                                   magic: FileOpenersBinaryFormat.requestMagic,
+                                                   path: entry.path) else {
+            completion([])
+            return
+        }
+        urlSession.dataTask(with: request) { data, _, _ in
+            let openers = data.flatMap(Self.decodeFileOpeners) ?? []
+            Task { @MainActor in
+                completion(openers)
+            }
+        }.resume()
+    }
+
+    nonisolated private static func binaryPathRequest(url: URL, magic: UInt32, path: String) -> URLRequest? {
+        var payload = BinaryPayloadBuilder(referenceBaseOffset: 0)
+        payload.append(uint32: magic)
+        payload.append(uint32: 1)
+        guard payload.append(stringReference: path),
+              let data = payload.finalize() else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        return request
+    }
+
+    nonisolated private static func binaryDirectoryNameRequest(url: URL,
+                                                              magic: UInt32,
+                                                              directory: String,
+                                                              name: String) -> URLRequest? {
+        var payload = BinaryPayloadBuilder(referenceBaseOffset: 0)
+        payload.append(uint32: magic)
+        payload.append(uint32: 1)
+        guard payload.append(stringReference: directory),
+              payload.append(stringReference: name),
+              let data = payload.finalize() else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        return request
+    }
+
+    nonisolated private static func decodeFileList(_ data: Data) throws -> FileListResponse {
+        guard data.count >= FileListBinaryFormat.headerSize else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError)
+        }
+        var header = BinaryPayloadCursor(data)
+        guard header.readUInt32() == FileListBinaryFormat.magic,
+              header.readUInt32() == FileListBinaryFormat.version,
+              let rowCountValue = header.readUInt32(),
+              header.readUInt32() == UInt32(FileListBinaryFormat.rowSize),
+              let rowsOffsetValue = header.readUInt32(),
+              let variableOffsetValue = header.readUInt32(),
+              let totalSizeValue = header.readUInt32() else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError)
+        }
+        _ = header.readUInt32()
+        guard let path = header.readStringReference(),
+              let parent = header.readStringReference() else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError)
+        }
+
+        let rowCount = Int(rowCountValue)
+        let rowsOffset = Int(rowsOffsetValue)
+        let variableOffset = Int(variableOffsetValue)
+        let totalSize = Int(totalSizeValue)
+        guard totalSize <= data.count,
+              rowsOffset >= FileListBinaryFormat.headerSize,
+              variableOffset >= rowsOffset,
+              rowCount <= (variableOffset - rowsOffset) / FileListBinaryFormat.rowSize else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError)
+        }
+
+        var entries: [FileEntry] = []
+        entries.reserveCapacity(rowCount)
+        for index in 0..<rowCount {
+            var row = BinaryPayloadCursor(data, offset: rowsOffset + index * FileListBinaryFormat.rowSize)
+            guard let name = row.readStringReference(),
+                  let path = row.readStringReference(),
+                  let mode = row.readStringReference(),
+                  let isDirectoryValue = row.readUInt32(),
+                  row.readUInt32() != nil,
+                  let size = row.readUInt64(),
+                  let modifiedMillis = row.readUInt64() else {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError)
+            }
+            entries.append(FileEntry(name: name,
+                                     path: path,
+                                     isDirectory: isDirectoryValue != 0,
+                                     size: size,
+                                     modified: Double(modifiedMillis) / 1000.0,
+                                     mode: mode))
+        }
+        return FileListResponse(path: path, parent: parent.isEmpty ? nil : parent, entries: entries)
+    }
+
+    nonisolated private static func decodeFileOpeners(_ data: Data) -> [FileOpener]? {
+        guard data.count >= FileOpenersBinaryFormat.headerSize else { return nil }
+        var header = BinaryPayloadCursor(data)
+        guard header.readUInt32() == FileOpenersBinaryFormat.magic,
+              header.readUInt32() == FileOpenersBinaryFormat.version,
+              let rowCountValue = header.readUInt32(),
+              header.readUInt32() == UInt32(FileOpenersBinaryFormat.rowSize),
+              let rowsOffsetValue = header.readUInt32(),
+              let variableOffsetValue = header.readUInt32(),
+              let totalSizeValue = header.readUInt32() else {
+            return nil
+        }
+
+        let rowCount = Int(rowCountValue)
+        let rowsOffset = Int(rowsOffsetValue)
+        let variableOffset = Int(variableOffsetValue)
+        let totalSize = Int(totalSizeValue)
+        guard totalSize <= data.count,
+              rowsOffset >= FileOpenersBinaryFormat.headerSize,
+              variableOffset >= rowsOffset,
+              rowCount <= (variableOffset - rowsOffset) / FileOpenersBinaryFormat.rowSize else {
+            return nil
+        }
+
+        var openers: [FileOpener] = []
+        openers.reserveCapacity(rowCount)
+        for index in 0..<rowCount {
+            var row = BinaryPayloadCursor(data, offset: rowsOffset + index * FileOpenersBinaryFormat.rowSize)
+            guard let extensionName = row.readStringReference(),
+                  let serviceID = row.readStringReference(),
+                  let displayName = row.readStringReference(),
+                  let socketPath = row.readStringReference(),
+                  let url = row.readStringReference() else {
+                return nil
+            }
+            openers.append(FileOpener(extensionName: extensionName,
+                                      serviceID: serviceID,
+                                      displayName: displayName,
+                                      socketPath: socketPath,
+                                      url: url))
+        }
+        return openers
+    }
+
+    private func openerNavigationURL(_ opener: FileOpener) -> URL? {
+        let socketPath = opener.socketPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !socketPath.isEmpty {
+            let path = pathAndQuery(fromOpenerURL: opener.url, socketPath: socketPath)
+            return URL(string: "http+unix://\(percentEncodedSocketPath(socketPath))\(path)")
+        }
+
+        let rawURL = opener.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let parsed = URL(string: rawURL), parsed.scheme != nil {
+            return parsed
+        }
+        return URL(string: rawURL)
+    }
+
+    private func pathAndQuery(fromOpenerURL rawURL: String, socketPath: String) -> String {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "/" }
+
+        if trimmed == socketPath { return "/" }
+        if trimmed.hasPrefix(socketPath) {
+            let suffix = String(trimmed.dropFirst(socketPath.count))
+            return normalizedPathAndQuery(suffix)
+        }
+
+        if trimmed.lowercased().hasPrefix("http+unix://") {
+            let prefixLength = "http+unix://".count
+            let startIndex = trimmed.index(trimmed.startIndex, offsetBy: prefixLength)
+            let authorityAndSuffix = String(trimmed[startIndex...])
+            let suffixStart = authorityAndSuffix.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) ?? authorityAndSuffix.endIndex
+            return normalizedPathAndQuery(String(authorityAndSuffix[suffixStart...]))
+        }
+
+        if let components = URLComponents(string: trimmed), components.scheme != nil {
+            var path = components.path.isEmpty ? "/" : components.path
+            if let query = components.query, !query.isEmpty {
+                path += "?\(query)"
+            }
+            return normalizedPathAndQuery(path)
+        }
+
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("?") || trimmed.hasPrefix("#") {
+            return normalizedPathAndQuery(trimmed)
+        }
+        return normalizedPathAndQuery(trimmed)
+    }
+
+    private func normalizedPathAndQuery(_ value: String) -> String {
+        if value.isEmpty { return "/" }
+        if value.hasPrefix("/") { return value }
+        if value.hasPrefix("?") || value.hasPrefix("#") { return "/\(value)" }
+        return "/\(value)"
+    }
+
+    private func percentEncodedSocketPath(_ socketPath: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return socketPath.addingPercentEncoding(withAllowedCharacters: allowed) ?? socketPath
     }
 
     private func addFavorite(_ entry: FileEntry) {
@@ -1235,25 +1548,25 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private nonisolated static func remoteFileList(path: String,
                                                    filesEndpoint: URL,
                                                    using urlSession: URLSession) async throws -> FileListResponse {
-        var components = URLComponents(url: filesEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "path", value: path)]
-        guard let url = components?.url else {
+        guard let request = binaryPathRequest(url: filesEndpoint,
+                                              magic: FilePathRequestBinaryFormat.magic,
+                                              path: path) else {
             throw NSError(domain: NSURLErrorDomain,
                           code: NSURLErrorBadURL,
                           userInfo: [NSLocalizedDescriptionKey: "Could not build directory listing URL."])
         }
 
-        let (data, response) = try await urlSession.data(from: url)
+        let (data, response) = try await urlSession.data(for: request)
         if let httpResponse = response as? HTTPURLResponse,
            !(200..<300).contains(httpResponse.statusCode) {
             throw NSError(domain: NSURLErrorDomain,
                           code: NSURLErrorBadServerResponse,
                           userInfo: [
                             NSLocalizedDescriptionKey: "Directory listing failed with HTTP \(httpResponse.statusCode).",
-                            NSURLErrorFailingURLErrorKey: url
+                            NSURLErrorFailingURLErrorKey: request.url as Any
                           ])
         }
-        return try JSONDecoder().decode(FileListResponse.self, from: data)
+        return try decodeFileList(data)
     }
 
     private nonisolated static func remoteFileDownloadURL(path: String,
@@ -1536,19 +1849,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                           name: String,
                                                           mkdirEndpoint: URL,
                                                           using urlSession: URLSession) async throws {
-        var components = URLComponents(url: mkdirEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
-            URLQueryItem(name: "directory", value: parent),
-            URLQueryItem(name: "name", value: name)
-        ]
-        guard let url = components?.url else {
+        guard let request = binaryDirectoryNameRequest(url: mkdirEndpoint,
+                                                       magic: FileMkdirRequestBinaryFormat.magic,
+                                                       directory: parent,
+                                                       name: name) else {
             throw NSError(domain: NSURLErrorDomain,
                           code: NSURLErrorBadURL,
                           userInfo: [NSLocalizedDescriptionKey: "Could not build mkdir URL."])
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
         let (_, response) = try await urlSession.data(for: request)
         if let http = response as? HTTPURLResponse,
            !(200..<300).contains(http.statusCode) {
