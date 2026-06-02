@@ -298,6 +298,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var breadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
     private var pendingFavoriteMenuEntries: [UUID: FileEntry] = [:]
     private var pendingOpenMenuEntries: [UUID: (entry: FileEntry, openers: [FileOpener])] = [:]
+    private var accessibilityNotificationScheduled = false
 
     private let favoritesBarHeight: CGFloat = 36
     private let breadcrumbBarHeight: CGFloat = 34
@@ -392,7 +393,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
-                                                             snapshot: OuterframeAccessibilitySnapshot.notImplementedSnapshot())
+                                                             snapshot: buildAccessibilitySnapshot())
 
         case .shutdown:
             retainedSelf = nil
@@ -479,6 +480,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             updateBreadcrumbBar()
             updateRows()
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func updateColors() {
@@ -631,6 +633,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         guard !hasRegisteredLayer, let registerLayer = appConnection.registerLayer else { return }
         registerLayer(rootLayer)
         hasRegisteredLayer = true
+        notifyAccessibilityLayoutChanged()
     }
 
     private func pathFromURL(_ urlString: String?) -> String? {
@@ -685,11 +688,13 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 if let error {
                     self.shouldReplaceHistoryEntryAfterLoad = false
                     self.statusLayer.string = error.localizedDescription
+                    self.notifyAccessibilityLayoutChanged()
                     return
                 }
                 guard let data else {
                     self.shouldReplaceHistoryEntryAfterLoad = false
                     self.statusLayer.string = "No response"
+                    self.notifyAccessibilityLayoutChanged()
                     return
                 }
                 do {
@@ -720,6 +725,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 } catch {
                     self.statusLayer.string = "Could not read file list"
                     self.shouldReplaceHistoryEntryAfterLoad = false
+                    self.notifyAccessibilityLayoutChanged()
                 }
             }
         }.resume()
@@ -728,9 +734,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func updateRows() {
         withoutImplicitAnimations {
             rowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-            guard !entries.isEmpty else { return }
-
-            appearance.performAsCurrentDrawingAppearance {
+            if !entries.isEmpty {
+                appearance.performAsCurrentDrawingAppearance {
                 let visibleStart = max(Int(floor(scrollOffset / rowHeight)), 0)
                 let visibleCount = Int(ceil(rowsClipLayer.bounds.height / rowHeight)) + 2
                 let visibleEnd = min(entries.count, visibleStart + visibleCount)
@@ -787,7 +792,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     rowsClipLayer.addSublayer(rowLayer)
                 }
             }
+            }
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func handleMouseDown(at point: CGPoint, clickCount: Int) {
@@ -1925,6 +1932,157 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func formatByteCount(_ value: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file)
+    }
+
+    private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
+        var nextIdentifier: UInt32 = 1
+        var children: [OuterframeAccessibilityNode] = []
+
+        children.append(contentsOf: buildFavoritesAccessibilityNodes(nextIdentifier: &nextIdentifier))
+        children.append(contentsOf: buildBreadcrumbAccessibilityNodes(nextIdentifier: &nextIdentifier))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .staticText,
+                                          frame: headerLayer.convert(nameHeaderLayer.frame, to: rootLayer),
+                                          label: "Name"))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .staticText,
+                                          frame: headerLayer.convert(modifiedHeaderLayer.frame, to: rootLayer),
+                                          label: "Modified"))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .staticText,
+                                          frame: headerLayer.convert(sizeHeaderLayer.frame, to: rootLayer),
+                                          label: "Size"))
+        children.append(buildFileTableAccessibilityNode(nextIdentifier: &nextIdentifier))
+
+        if let status = statusLayer.string as? String, !status.isEmpty {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                             role: .staticText,
+                                             frame: statusLayer.frame,
+                                             label: status))
+        }
+
+        let rootNode = OuterframeAccessibilityNode(identifier: 0,
+                                                   role: .container,
+                                                   frame: rootLayer.bounds,
+                                                   label: "Files",
+                                                   children: children)
+        return OuterframeAccessibilitySnapshot(rootNodes: [rootNode])
+    }
+
+    private func buildFavoritesAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        let favorites = [(title: "Home", path: homePath ?? "~")] + favoriteLocations.map { (title: $0.title, path: $0.path) }
+        var nodes: [OuterframeAccessibilityNode] = []
+        for (index, favorite) in favorites.enumerated() where index < favoriteFrames.count {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: favoritesBarLayer.convert(favoriteFrames[index].frame, to: rootLayer),
+                                           label: favorite.title,
+                                           value: favorite.path,
+                                           hint: favorite.path == currentPath ? "Current location" : "Open location"))
+        }
+        return nodes
+    }
+
+    private func buildBreadcrumbAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        let segments = breadcrumbSegments()
+        var nodes: [OuterframeAccessibilityNode] = []
+        for (index, segment) in segments.enumerated() where index < breadcrumbSegmentFrames.count {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: breadcrumbBarLayer.convert(breadcrumbSegmentFrames[index].frame, to: rootLayer),
+                                           label: segment.title,
+                                           value: segment.path,
+                                           hint: segment.path == currentPath ? "Current folder" : "Open folder"))
+        }
+        return nodes
+    }
+
+    private func buildFileTableAccessibilityNode(nextIdentifier: inout UInt32) -> OuterframeAccessibilityNode {
+        var rowNodes: [OuterframeAccessibilityNode] = []
+        let contentWidth = max(rowsClipLayer.bounds.width - horizontalInset * 2, 1)
+        let nameWidth = floor(contentWidth * nameColumnWidth)
+        let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
+        let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
+        let visibleStart = max(Int(floor(scrollOffset / rowHeight)), 0)
+        let visibleCount = Int(ceil(rowsClipLayer.bounds.height / rowHeight)) + 2
+        let visibleEnd = min(entries.count, visibleStart + visibleCount)
+
+        if visibleStart < visibleEnd {
+            for index in visibleStart..<visibleEnd {
+                let entry = entries[index]
+                let top = rowsClipLayer.bounds.height - CGFloat(index) * rowHeight + scrollOffset - rowHeight
+                let rowFrame = CGRect(x: 0, y: top, width: rowsClipLayer.bounds.width, height: rowHeight)
+                let type = entry.isDirectory ? "Folder" : "File"
+                let size = entry.isDirectory ? "" : formatByteCount(entry.size)
+                let selectedPrefix = selectedIndex == index ? "Selected, " : ""
+                let rowLabel = "\(selectedPrefix)\(entry.name), \(type), modified \(formatModified(entry.modified))\(size.isEmpty ? "" : ", \(size)")"
+                let cells = [
+                    accessibilityNode(nextIdentifier: &nextIdentifier,
+                                      role: .cell,
+                                      frame: rowsClipLayer.convert(CGRect(x: horizontalInset, y: top, width: nameWidth, height: rowHeight), to: rootLayer),
+                                      label: "Name",
+                                      value: entry.name),
+                    accessibilityNode(nextIdentifier: &nextIdentifier,
+                                      role: .cell,
+                                      frame: rowsClipLayer.convert(CGRect(x: horizontalInset + nameWidth, y: top, width: modifiedWidth, height: rowHeight), to: rootLayer),
+                                      label: "Modified",
+                                      value: formatModified(entry.modified)),
+                    accessibilityNode(nextIdentifier: &nextIdentifier,
+                                      role: .cell,
+                                      frame: rowsClipLayer.convert(CGRect(x: horizontalInset + nameWidth + modifiedWidth, y: top, width: sizeWidth, height: rowHeight), to: rootLayer),
+                                      label: "Size",
+                                      value: entry.isDirectory ? "Folder" : size)
+                ]
+                rowNodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                                 role: .row,
+                                                 frame: rowsClipLayer.convert(rowFrame, to: rootLayer),
+                                                 label: rowLabel,
+                                                 value: entry.path,
+                                                 hint: entry.isDirectory ? "Open folder" : "Open file",
+                                                 children: cells))
+            }
+        }
+
+        return accessibilityNode(nextIdentifier: &nextIdentifier,
+                                 role: .table,
+                                 frame: rowsClipLayer.frame,
+                                 label: "Files in \(currentPath)",
+                                 children: rowNodes,
+                                 rowCount: entries.count,
+                                 columnCount: 3)
+    }
+
+    private func accessibilityNode(nextIdentifier: inout UInt32,
+                                   role: OuterframeAccessibilityRole,
+                                   frame: CGRect,
+                                   label: String? = nil,
+                                   value: String? = nil,
+                                   hint: String? = nil,
+                                   children: [OuterframeAccessibilityNode] = [],
+                                   rowCount: Int? = nil,
+                                   columnCount: Int? = nil,
+                                   isEnabled: Bool = true) -> OuterframeAccessibilityNode {
+        let identifier = nextIdentifier
+        nextIdentifier = nextIdentifier == UInt32.max ? 1 : nextIdentifier + 1
+        return OuterframeAccessibilityNode(identifier: identifier,
+                                           role: role,
+                                           frame: frame,
+                                           label: label,
+                                           value: value,
+                                           hint: hint,
+                                           children: children,
+                                           rowCount: rowCount,
+                                           columnCount: columnCount,
+                                           isEnabled: isEnabled)
+    }
+
+    private func notifyAccessibilityLayoutChanged() {
+        guard hasRegisteredLayer, !accessibilityNotificationScheduled else { return }
+        accessibilityNotificationScheduled = true
+        Task { @MainActor in
+            accessibilityNotificationScheduled = false
+            outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
+        }
     }
 }
 
