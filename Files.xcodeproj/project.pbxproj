@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		37AA00012FEA000000000001 /* app-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = 37AA00022FEA000000000001 /* app-icon.png */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		0F0000000000000000000011 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -25,6 +29,7 @@
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
+		37AA00022FEA000000000001 /* app-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "app-icon.png"; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -64,6 +69,7 @@
 				0F0000000000000000000004 /* Frontend */,
 				0F0000000000000000000005 /* Vendor */,
 				0F0000000000000000000006 /* Scripts */,
+				37AA00022FEA000000000001 /* app-icon.png */,
 				0F0000000000000000000007 /* Info.plist */,
 				0F0000000000000000000008 /* README.md */,
 				37B4F9C12FA189AB00873894 /* AGENTS.md */,
@@ -151,6 +157,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				37AA00012FEA000000000001 /* app-icon.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

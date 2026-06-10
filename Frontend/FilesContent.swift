@@ -328,6 +328,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                      proxyPort: arguments.proxy?.port ?? 0,
                                      proxyUsername: arguments.proxy?.username,
                                      proxyPassword: arguments.proxy?.password)
+            outerframeHost.setTitle("Files")
+            outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
             appearance = arguments.appearance ?? appearance
             currentSize = arguments.contentSize ?? currentSize
             configureNetworking()
