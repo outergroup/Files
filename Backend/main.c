@@ -290,49 +290,6 @@ static void write_u32_le_at(char *data, size_t offset, uint32_t value) {
     data[offset + 3] = (char)((value >> 24) & 0xffu);
 }
 
-static bool extension_for_path(const char *path, char *out, size_t out_size) {
-    if (!path || !path[0] || !out || out_size == 0) return false;
-    const char *basename = strrchr(path, '/');
-    basename = basename ? basename + 1 : path;
-    const char *dot = strrchr(basename, '.');
-    if (!dot || dot == basename || !dot[1]) return false;
-    size_t offset = 0;
-    for (const unsigned char *p = (const unsigned char *)(dot + 1); *p && offset + 1 < out_size; p++) {
-        out[offset++] = (char)tolower(*p);
-    }
-    if ((dot + 1)[offset] != '\0') return false;
-    out[offset] = '\0';
-    return offset > 0;
-}
-
-static bool file_looks_like_text(const char *path) {
-    struct stat st;
-    if (!path || !path[0] || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
-    if (st.st_size == 0) return true;
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-
-    unsigned char buffer[16384];
-    ssize_t n;
-    do {
-        n = read(fd, buffer, sizeof(buffer));
-    } while (n < 0 && errno == EINTR);
-    close(fd);
-    if (n < 0) return false;
-    if (n == 0) return true;
-
-    size_t control_count = 0;
-    for (ssize_t i = 0; i < n; i++) {
-        unsigned char c = buffer[i];
-        if (c == 0) return false;
-        if (c < 32 && c != '\t' && c != '\n' && c != '\r' && c != '\f' && c != '\b') {
-            control_count++;
-        }
-    }
-    return control_count * 100 <= (size_t)n;
-}
-
 enum {
     FILE_PATH_REQUEST_BINARY_MAGIC = 0x51465046u,
     FILE_MKDIR_REQUEST_BINARY_MAGIC = 0x51444d46u,
@@ -591,16 +548,14 @@ static bool send_outerctl_invoke_to_outershelld(const char *const *arguments, si
     return ok;
 }
 
-static bool query_file_openers_from_outershelld(const char *extension,
-                                                const char *detected_kind,
-                                                const char *path,
+static bool query_file_openers_from_outershelld(const char *path,
+                                                const char *content_type,
                                                 StringBuilder *response) {
     StringBuilder message = {0};
     bool ok = sb_append_u16_le(&message, OUTERSHELLD_API_FILE_OPENERS_QUERY) &&
-              sb_append_zero(&message, 24) &&
-              api_message_append_string_ref_at(&message, 2, extension) &&
-              api_message_append_string_ref_at(&message, 10, path) &&
-              api_message_append_string_ref_at(&message, 18, detected_kind);
+              sb_append_zero(&message, 16) &&
+              api_message_append_string_ref_at(&message, 2, path) &&
+              api_message_append_string_ref_at(&message, 10, content_type ? content_type : "");
     ok = ok && send_outershelld_api_message(&message, response);
     free(message.data);
     return ok;
@@ -620,20 +575,14 @@ static void send_empty_openers_response(int fd) {
 
 static void send_openers_response_for_path(int fd, const char *requested) {
     char path[PATH_MAX];
-    char extension[128] = "";
-    const char *detected_kind = "";
     resolve_requested_path(requested, path, sizeof(path));
-    extension_for_path(path, extension, sizeof(extension));
-    if (file_looks_like_text(path)) {
-        detected_kind = "text";
-    }
-    if ((!extension[0] && !detected_kind[0]) || !g_outershelld_api_socket_path[0]) {
+    if (!g_outershelld_api_socket_path[0]) {
         send_empty_openers_response(fd);
         return;
     }
 
     StringBuilder api_response = {0};
-    if (!query_file_openers_from_outershelld(extension, detected_kind, path, &api_response) ||
+    if (!query_file_openers_from_outershelld(path, "", &api_response) ||
         api_response.length < OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE ||
         read_u16_le_from_bytes((const unsigned char *)api_response.data, 0) != OUTERSHELLD_API_FILE_OPENERS_RESPONSE ||
         read_u32_le_from_bytes((const unsigned char *)api_response.data, 2) != 0) {

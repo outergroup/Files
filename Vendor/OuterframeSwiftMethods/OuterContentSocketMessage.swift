@@ -104,6 +104,7 @@ enum BrowserToContentMessage {
     case viewFocusChanged(isFocused: Bool)
     case selectionToPasteboardCopyRequest(requestID: UUID)
     case selectionToPasteboardCutRequest(requestID: UUID)
+    case editCommandValidationRequest(requestID: UUID, commands: OuterframeEditCommandSet)
     case pasteboardContentPasted(items: [OuterframeContentPasteboardItem])
     case pasteboardContentDropped(point: CGPoint, items: [OuterframeContentPasteboardItem])
     case pasteboardDropHitTestRequest(requestID: UUID,
@@ -375,6 +376,12 @@ enum BrowserToContentMessage {
             var payload = Data(capacity: 16)
             payload.append(uuid: requestID)
             return makeBrowserToContentFrame(type: .selectionToPasteboardCutRequest, payload: payload)
+
+        case .editCommandValidationRequest(let requestID, let commands):
+            var payload = Data(capacity: 20)
+            payload.append(uuid: requestID)
+            payload.append(uint32: commands.rawValue)
+            return makeBrowserToContentFrame(type: .editCommandValidationRequest, payload: payload)
 
         case .pasteboardContentPasted(let items):
             let payload = try encodePasteboardItems(items)
@@ -783,6 +790,14 @@ enum BrowserToContentMessage {
             }
             return .selectionToPasteboardCutRequest(requestID: requestID)
 
+        case .editCommandValidationRequest:
+            guard let requestID = cursor.readUUID(),
+                  let commandsRaw = cursor.readUInt32() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .editCommandValidationRequest(requestID: requestID,
+                                                 commands: OuterframeEditCommandSet(rawValue: commandsRaw))
+
         case .pasteboardContentPasted:
             let items = try readPasteboardItems(cursor: &cursor)
             return .pasteboardContentPasted(items: items)
@@ -901,7 +916,7 @@ enum ContentToBrowserMessage {
                               attributedTextData: Data?,
                               items: [OuterframeContextMenuItem])
     case showDefinition(attributedTextData: Data, locationX: CGFloat, locationY: CGFloat)
-    case textCursorUpdate(cursors: [OuterframeContentTextCursorSnapshot])
+    case textInputGeometryUpdate(geometry: OuterframeContentTextInputGeometry?)
     case selectionToPasteboardResponse(requestID: UUID, items: [OuterframeContentPasteboardItem])
     case pasteboardAccessRequest(requestID: UUID,
                                  operation: OuterframePasteboardAccessOperation,
@@ -917,7 +932,8 @@ enum ContentToBrowserMessage {
                                   errorMessage: String?)
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
     case navigate(url: String)
-    case setEditingCapabilities(canCopy: Bool, canCut: Bool)
+    case openNewTab(url: String, displayString: String?)
+    case editCommandValidationResponse(requestID: UUID, enabledCommands: OuterframeEditCommandSet)
     case setPasteboardDropBehaviorUniform([String])
     case setAcceptedPasteboardPasteTypes([String])
     case setPasteboardDropBehaviorHitTest
@@ -970,13 +986,7 @@ enum ContentToBrowserMessage {
             payload.append(uint16: clampedCount)
             try payload.append(dataReference: attributedTextData ?? Data())
             for item in items.prefix(Int(clampedCount)) {
-                var flags: UInt8 = 0
-                if item.isEnabled { flags |= 1 << 0 }
-                if item.isSeparator { flags |= 1 << 1 }
-                payload.append(uint8: flags)
-                payload.append(uint8: item.action.rawValue)
-                try payload.append(stringReference: item.id)
-                try payload.append(stringReference: item.title)
+                try appendContextMenuItem(item, to: &payload)
             }
             return makeContentToBrowserFrame(type: .showContextMenuItems, payload: try payload.finalize())
 
@@ -987,19 +997,19 @@ enum ContentToBrowserMessage {
             try payload.append(dataReference: attributedTextData)
             return makeContentToBrowserFrame(type: .showDefinition, payload: try payload.finalize())
 
-        case .textCursorUpdate(let cursors):
+        case .textInputGeometryUpdate(let geometry):
             var payload = Data()
-            let countValue = UInt32(max(0, min(cursors.count, Int(UInt32.max))))
-            payload.append(uint32: countValue)
-            for cursor in cursors {
-                payload.append(uuid: cursor.fieldID)
-                payload.append(float64: cursor.rect.origin.x)
-                payload.append(float64: cursor.rect.origin.y)
-                payload.append(float64: cursor.rect.size.width)
-                payload.append(float64: cursor.rect.size.height)
-                payload.append(uint8: cursor.visible ? 1 << 0 : 0)
+            if let geometry {
+                payload.append(uint8: 1 << 0)
+                payload.append(uuid: geometry.fieldID)
+                payload.append(float64: geometry.rect.origin.x)
+                payload.append(float64: geometry.rect.origin.y)
+                payload.append(float64: geometry.rect.size.width)
+                payload.append(float64: geometry.rect.size.height)
+            } else {
+                payload.append(uint8: 0)
             }
-            return makeContentToBrowserFrame(type: .textCursorUpdate, payload: payload)
+            return makeContentToBrowserFrame(type: .textInputGeometryUpdate, payload: payload)
 
         case .selectionToPasteboardResponse(let requestID, let items):
             var payload = OffsetPayloadBuilder()
@@ -1061,13 +1071,20 @@ enum ContentToBrowserMessage {
             try payload.append(stringReference: url)
             return makeContentToBrowserFrame(type: .navigate, payload: try payload.finalize())
 
-        case .setEditingCapabilities(let canCopy, let canCut):
-            var payload = Data(capacity: 1)
+        case .openNewTab(let url, let displayString):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: url)
             var flags: UInt8 = 0
-            if canCopy { flags |= 1 << 0 }
-            if canCut { flags |= 1 << 1 }
+            if displayString != nil { flags |= 1 << 0 }
             payload.append(uint8: flags)
-            return makeContentToBrowserFrame(type: .setEditingCapabilities, payload: payload)
+            try payload.append(stringReference: displayString ?? "")
+            return makeContentToBrowserFrame(type: .openNewTab, payload: try payload.finalize())
+
+        case .editCommandValidationResponse(let requestID, let enabledCommands):
+            var payload = Data(capacity: 20)
+            payload.append(uuid: requestID)
+            payload.append(uint32: enabledCommands.rawValue)
+            return makeContentToBrowserFrame(type: .editCommandValidationResponse, payload: payload)
 
         case .setPasteboardDropBehaviorUniform(let pasteboardTypes):
             var payload = OffsetPayloadBuilder()
@@ -1189,17 +1206,7 @@ enum ContentToBrowserMessage {
             var items: [OuterframeContextMenuItem] = []
             items.reserveCapacity(Int(count))
             for _ in 0..<count {
-                guard let flags = cursor.readUInt8(),
-                      let actionRawValue = cursor.readUInt8(),
-                      let id = cursor.readStringReference(),
-                      let title = cursor.readStringReference() else {
-                    throw OuterframeContentSocketMessageError.truncatedPayload
-                }
-                items.append(OuterframeContextMenuItem(id: id,
-                                                       title: title,
-                                                       action: OuterframeContextMenuItemAction(rawValue: actionRawValue) ?? .contentCommand,
-                                                       isEnabled: flags & (1 << 0) != 0,
-                                                       isSeparator: flags & (1 << 1) != 0))
+                items.append(try readContextMenuItem(from: &cursor))
             }
             return .showContextMenuItems(menuID: menuID,
                                          locationX: locationX,
@@ -1216,29 +1223,25 @@ enum ContentToBrowserMessage {
             return .showDefinition(attributedTextData: attributedTextData,
                                    locationX: locationX, locationY: locationY)
 
-        case .textCursorUpdate:
-            guard let cursorCount = cursor.readUInt32() else {
+        case .textInputGeometryUpdate:
+            guard let flags = cursor.readUInt8() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            var entries: [OuterframeContentTextCursorSnapshot] = []
-            entries.reserveCapacity(Int(cursorCount))
-            for _ in 0..<cursorCount {
+            if flags & (1 << 0) != 0 {
                 guard let fieldID = cursor.readUUID(),
                       let rectX = cursor.readFloat64(),
                       let rectY = cursor.readFloat64(),
                       let rectWidth = cursor.readFloat64(),
-                      let rectHeight = cursor.readFloat64(),
-                      let flags = cursor.readUInt8() else {
+                      let rectHeight = cursor.readFloat64() else {
                     throw OuterframeContentSocketMessageError.truncatedPayload
                 }
-                entries.append(OuterframeContentTextCursorSnapshot(fieldID: fieldID,
-                                                                   rect: CGRect(x: rectX,
-                                                                                y: rectY,
-                                                                                width: rectWidth,
-                                                                                height: rectHeight),
-                                                                   visible: flags & (1 << 0) != 0))
+                return .textInputGeometryUpdate(geometry: OuterframeContentTextInputGeometry(fieldID: fieldID,
+                                                                                             rect: CGRect(x: rectX,
+                                                                                                          y: rectY,
+                                                                                                          width: rectWidth,
+                                                                                                          height: rectHeight)))
             }
-            return .textCursorUpdate(cursors: entries)
+            return .textInputGeometryUpdate(geometry: nil)
 
         case .selectionToPasteboardResponse:
             guard let requestID = cursor.readUUID() else {
@@ -1298,12 +1301,13 @@ enum ContentToBrowserMessage {
                                              deleteWhenDone: flags & (1 << 1) != 0,
                                              errorMessage: errorMessage.isEmpty ? nil : errorMessage)
 
-        case .setEditingCapabilities:
-            guard let flags = cursor.readUInt8() else {
+        case .editCommandValidationResponse:
+            guard let requestID = cursor.readUUID(),
+                  let enabledCommandsRaw = cursor.readUInt32() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            return .setEditingCapabilities(canCopy: flags & (1 << 0) != 0,
-                                           canCut: flags & (1 << 1) != 0)
+            return .editCommandValidationResponse(requestID: requestID,
+                                                  enabledCommands: OuterframeEditCommandSet(rawValue: enabledCommandsRaw))
 
         case .setPasteboardDropBehaviorUniform:
             guard let count = cursor.readUInt16() else {
@@ -1406,16 +1410,24 @@ enum ContentToBrowserMessage {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
             return .navigate(url: url)
+
+        case .openNewTab:
+            guard let url = cursor.readStringReference(),
+                  let flags = cursor.readUInt8(),
+                  let displayStringReference = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let displayString = flags & (1 << 0) != 0 ? displayStringReference : nil
+            return .openNewTab(url: url, displayString: displayString)
         }
     }
 }
 
 // MARK: - Supporting Types
 
-struct OuterframeContentTextCursorSnapshot: Sendable {
+struct OuterframeContentTextInputGeometry: Sendable {
     let fieldID: UUID
     let rect: CGRect
-    let visible: Bool
 }
 
 struct OuterframeContentPasteboardRepresentation: Sendable {
@@ -1456,11 +1468,25 @@ struct OuterframeContentDraggingItem: Sendable {
 typealias OuterContentPasteboardItem = OuterframeContentPasteboardItem
 typealias OuterContentPasteboardRepresentation = OuterframeContentPasteboardRepresentation
 typealias OuterContentDraggingItem = OuterframeContentDraggingItem
-typealias OuterContentTextCursorSnapshot = OuterframeContentTextCursorSnapshot
+typealias OuterContentTextInputGeometry = OuterframeContentTextInputGeometry
 
 public enum OuterframePasteboardAccessOperation: UInt8, Sendable {
     case read = 0
     case write = 1
+}
+
+public struct OuterframeEditCommandSet: OptionSet, Sendable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public static let copy = OuterframeEditCommandSet(rawValue: 1 << 0)
+    public static let cut = OuterframeEditCommandSet(rawValue: 1 << 1)
+    public static let paste = OuterframeEditCommandSet(rawValue: 1 << 2)
+    public static let selectAll = OuterframeEditCommandSet(rawValue: 1 << 3)
+    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll]
 }
 
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {
@@ -1473,23 +1499,96 @@ public enum OuterframeContextMenuItemAction: UInt8, Sendable {
     case standardServices = 6
 }
 
+public enum OuterframeContextMenuItemKind: UInt8, Sendable {
+    case command = 0
+    case separator = 1
+    case submenu = 2
+    case label = 3
+}
+
+public enum OuterframeContextMenuItemState: UInt8, Sendable {
+    case off = 0
+    case on = 1
+    case mixed = 2
+}
+
+public enum OuterframeContextMenuTextAlignment: UInt8, Sendable {
+    case natural = 0
+    case left = 1
+    case center = 2
+    case right = 3
+}
+
+public struct OuterframeContextMenuItemStyle: Sendable {
+    public var height: Float32
+    public var topInset: Float32
+    public var leftInset: Float32
+    public var bottomInset: Float32
+    public var rightInset: Float32
+    public var fontSize: Float32
+    public var fontWeight: Float32
+    public var textColorRGBA: UInt32
+    public var alignment: OuterframeContextMenuTextAlignment
+
+    public init(height: Float32 = 0,
+                topInset: Float32 = 0,
+                leftInset: Float32 = 0,
+                bottomInset: Float32 = 0,
+                rightInset: Float32 = 0,
+                fontSize: Float32 = 0,
+                fontWeight: Float32 = 0,
+                textColorRGBA: UInt32 = 0,
+                alignment: OuterframeContextMenuTextAlignment = .natural) {
+        self.height = height
+        self.topInset = topInset
+        self.leftInset = leftInset
+        self.bottomInset = bottomInset
+        self.rightInset = rightInset
+        self.fontSize = fontSize
+        self.fontWeight = fontWeight
+        self.textColorRGBA = textColorRGBA
+        self.alignment = alignment
+    }
+}
+
 public struct OuterframeContextMenuItem: Sendable {
     public let id: String
     public let title: String
+    public let kind: OuterframeContextMenuItemKind
     public let action: OuterframeContextMenuItemAction
     public let isEnabled: Bool
-    public let isSeparator: Bool
+    public let state: OuterframeContextMenuItemState
+    public let indentationLevel: UInt16
+    public let keyEquivalent: String
+    public let keyEquivalentModifierMask: UInt32
+    public let systemImageName: String
+    public let style: OuterframeContextMenuItemStyle
+    public let children: [OuterframeContextMenuItem]
 
     public init(id: String,
                 title: String,
+                kind: OuterframeContextMenuItemKind = .command,
                 action: OuterframeContextMenuItemAction = .contentCommand,
                 isEnabled: Bool = true,
-                isSeparator: Bool = false) {
+                state: OuterframeContextMenuItemState = .off,
+                indentationLevel: UInt16 = 0,
+                keyEquivalent: String = "",
+                keyEquivalentModifierMask: UInt32 = 0,
+                systemImageName: String = "",
+                style: OuterframeContextMenuItemStyle = OuterframeContextMenuItemStyle(),
+                children: [OuterframeContextMenuItem] = []) {
         self.id = id
         self.title = title
+        self.kind = kind
         self.action = action
         self.isEnabled = isEnabled
-        self.isSeparator = isSeparator
+        self.state = state
+        self.indentationLevel = indentationLevel
+        self.keyEquivalent = keyEquivalent
+        self.keyEquivalentModifierMask = keyEquivalentModifierMask
+        self.systemImageName = systemImageName
+        self.style = style
+        self.children = children
     }
 }
 
@@ -1541,6 +1640,7 @@ private enum BrowserToContentMessageKind: UInt16 {
     case selectionToPasteboardCutRequest = 1037
     case pasteboardDropHitTestRequest = 1038
     case filePromiseWriteRequest = 1039
+    case editCommandValidationRequest = 1040
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1550,12 +1650,12 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case stopDisplayLink = 2001
     case cursorUpdate = 2002
     case inputModeUpdate = 2003
-    case textCursorUpdate = 2004
+    case textInputGeometryUpdate = 2004
     case showContextMenu = 2005
     case showDefinition = 2006
     case hapticFeedback = 2007
     case selectionToPasteboardResponse = 2008
-    case setEditingCapabilities = 2009
+    case editCommandValidationResponse = 2009
     case accessibilitySnapshotResponse = 2010
     case accessibilityTreeChanged = 2011
     case openNewWindow = 2012
@@ -1572,6 +1672,7 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case releaseDroppedFileAccess = 2026
     case filePromiseWriteResponse = 2027
     case navigate = 2028
+    case openNewTab = 2029
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1594,6 +1695,92 @@ private func makeContentToBrowserFrame(type: ContentToBrowserMessageKind, payloa
     frame.append(uint16: type.rawValue)
     frame.append(payload)
     return frame
+}
+
+private func appendContextMenuItem(_ item: OuterframeContextMenuItem,
+                                   to payload: inout OffsetPayloadBuilder) throws {
+    payload.append(uint8: item.kind.rawValue)
+    payload.append(uint8: item.action.rawValue)
+    payload.append(uint8: item.isEnabled ? 1 : 0)
+    payload.append(uint8: item.state.rawValue)
+    payload.append(uint16: item.indentationLevel)
+    payload.append(uint16: UInt16(min(item.children.count, Int(UInt16.max))))
+    payload.append(uint32: item.keyEquivalentModifierMask)
+    payload.append(float32: item.style.height)
+    payload.append(float32: item.style.topInset)
+    payload.append(float32: item.style.leftInset)
+    payload.append(float32: item.style.bottomInset)
+    payload.append(float32: item.style.rightInset)
+    payload.append(float32: item.style.fontSize)
+    payload.append(float32: item.style.fontWeight)
+    payload.append(uint32: item.style.textColorRGBA)
+    payload.append(uint8: item.style.alignment.rawValue)
+    payload.append(uint8: 0)
+    payload.append(uint8: 0)
+    payload.append(uint8: 0)
+    try payload.append(stringReference: item.id)
+    try payload.append(stringReference: item.title)
+    try payload.append(stringReference: item.keyEquivalent)
+    try payload.append(stringReference: item.systemImageName)
+    for child in item.children.prefix(Int(UInt16.max)) {
+        try appendContextMenuItem(child, to: &payload)
+    }
+}
+
+private func readContextMenuItem(from cursor: inout DataCursor) throws -> OuterframeContextMenuItem {
+    guard let kindRawValue = cursor.readUInt8(),
+          let actionRawValue = cursor.readUInt8(),
+          let enabledRawValue = cursor.readUInt8(),
+          let stateRawValue = cursor.readUInt8(),
+          let indentationLevel = cursor.readUInt16(),
+          let childCount = cursor.readUInt16(),
+          let keyEquivalentModifierMask = cursor.readUInt32(),
+          let height = cursor.readFloat32(),
+          let topInset = cursor.readFloat32(),
+          let leftInset = cursor.readFloat32(),
+          let bottomInset = cursor.readFloat32(),
+          let rightInset = cursor.readFloat32(),
+          let fontSize = cursor.readFloat32(),
+          let fontWeight = cursor.readFloat32(),
+          let textColorRGBA = cursor.readUInt32(),
+          let alignmentRawValue = cursor.readUInt8(),
+          cursor.readUInt8() != nil,
+          cursor.readUInt8() != nil,
+          cursor.readUInt8() != nil,
+          let id = cursor.readStringReference(),
+          let title = cursor.readStringReference(),
+          let keyEquivalent = cursor.readStringReference(),
+          let systemImageName = cursor.readStringReference() else {
+        throw OuterframeContentSocketMessageError.truncatedPayload
+    }
+
+    var children: [OuterframeContextMenuItem] = []
+    children.reserveCapacity(Int(childCount))
+    for _ in 0..<childCount {
+        children.append(try readContextMenuItem(from: &cursor))
+    }
+
+    let style = OuterframeContextMenuItemStyle(height: height,
+                                               topInset: topInset,
+                                               leftInset: leftInset,
+                                               bottomInset: bottomInset,
+                                               rightInset: rightInset,
+                                               fontSize: fontSize,
+                                               fontWeight: fontWeight,
+                                               textColorRGBA: textColorRGBA,
+                                               alignment: OuterframeContextMenuTextAlignment(rawValue: alignmentRawValue) ?? .natural)
+    return OuterframeContextMenuItem(id: id,
+                                     title: title,
+                                     kind: OuterframeContextMenuItemKind(rawValue: kindRawValue) ?? .command,
+                                     action: OuterframeContextMenuItemAction(rawValue: actionRawValue) ?? .contentCommand,
+                                     isEnabled: enabledRawValue != 0,
+                                     state: OuterframeContextMenuItemState(rawValue: stateRawValue) ?? .off,
+                                     indentationLevel: indentationLevel,
+                                     keyEquivalent: keyEquivalent,
+                                     keyEquivalentModifierMask: keyEquivalentModifierMask,
+                                     systemImageName: systemImageName,
+                                     style: style,
+                                     children: children)
 }
 
 private func appendPasteboardItems<S: Sequence>(_ items: S,

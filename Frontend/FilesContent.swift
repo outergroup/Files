@@ -33,7 +33,7 @@ private struct FileEntry: Sendable {
 }
 
 private struct FileOpener: Sendable {
-    let extensionName: String
+    let contentType: String
     let serviceID: String
     let displayName: String
     let socketPath: String
@@ -296,7 +296,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var shouldReplaceHistoryEntryAfterLoad = false
     private var favoriteFrames: [(frame: CGRect, path: String)] = []
     private var breadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
-    private var pendingFavoriteMenuEntries: [UUID: FileEntry] = [:]
+    private var pendingDirectoryMenuEntries: [UUID: FileEntry] = [:]
     private var pendingOpenMenuEntries: [UUID: (entry: FileEntry, openers: [FileOpener])] = [:]
     private var accessibilityNotificationScheduled = false
 
@@ -375,6 +375,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         case .selectionToPasteboardCopyRequest(let requestID):
             handleSelectionToPasteboardCopyRequest(requestID: requestID)
+
+        case .selectionToPasteboardCutRequest(let requestID):
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: [])
+
+        case .editCommandValidationRequest(let requestID, let commands):
+            outerframeHost.sendEditCommandValidationResponse(
+                requestID: requestID,
+                enabledCommands: enabledEditCommands(in: commands)
+            )
 
         case .pasteboardContentPasted(let items):
             handleDroppedPasteboardItems(items, at: CGPoint(x: rowsClipLayer.bounds.midX, y: rowsClipLayer.bounds.midY))
@@ -948,8 +957,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func updatePasteboardCapabilities() {
-        let canCopyFile = selectedIndex.flatMap { entries.indices.contains($0) ? entries[$0] : nil }?.isDirectory == false
-        outerframeHost.setEditingCapabilities(canCopy: canCopyFile, canCut: false)
         outerframeHost.setAcceptedPasteboardPasteTypes([
             NSPasteboard.PasteboardType.fileURL.rawValue,
             Self.droppedFileAccessPasteboardTypeIdentifier
@@ -959,6 +966,17 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             Self.droppedFileAccessPasteboardTypeIdentifier,
             NSPasteboard.PasteboardType.string.rawValue
         ])
+    }
+
+    private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        var enabledCommands: OuterframeEditCommandSet = []
+        if requestedCommands.contains(.copy), selectedFileEntryForCopy() != nil {
+            enabledCommands.insert(.copy)
+        }
+        if requestedCommands.contains(.paste) {
+            enabledCommands.insert(.paste)
+        }
+        return enabledCommands
     }
 
     private func selectedFileEntryForCopy() -> FileEntry? {
@@ -1016,6 +1034,33 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
+    private var contextMenuSectionLabelStyle: OuterframeContextMenuItemStyle {
+        OuterframeContextMenuItemStyle(height: 23,
+                                       topInset: 4,
+                                       leftInset: 16,
+                                       bottomInset: 4,
+                                       rightInset: 8,
+                                       fontSize: 11,
+                                       fontWeight: Float32(NSFont.Weight.semibold.rawValue),
+                                       textColorRGBA: 0,
+                                       alignment: .left)
+    }
+
+    private func contextMenuLabel(id: String, title: String) -> OuterframeContextMenuItem {
+        OuterframeContextMenuItem(id: id,
+                                  title: title,
+                                  kind: .label,
+                                  isEnabled: false,
+                                  style: contextMenuSectionLabelStyle)
+    }
+
+    private func contextMenuSeparator(id: String) -> OuterframeContextMenuItem {
+        OuterframeContextMenuItem(id: id,
+                                  title: "",
+                                  kind: .separator,
+                                  isEnabled: false)
+    }
+
     private func handleRightMouseDown(at point: CGPoint) {
         let index = rowIndex(at: point)
         if entries.indices.contains(index), entries[index].isDirectory {
@@ -1025,12 +1070,24 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             updatePasteboardCapabilities()
 
             let menuID = UUID()
-            pendingFavoriteMenuEntries[menuID] = entry
+            pendingDirectoryMenuEntries[menuID] = entry
             outerframeHost.showContextMenu(menuID: menuID,
                                            items: [
+                                            contextMenuLabel(id: "directory-heading", title: entry.name),
+                                            OuterframeContextMenuItem(id: "open-directory",
+                                                                      title: "Open",
+                                                                      isEnabled: true,
+                                                                      systemImageName: "folder"),
                                             OuterframeContextMenuItem(id: "add-to-favorites",
                                                                       title: "Add to Favorites",
-                                                                      isEnabled: !isFavoritePath(entry.path))
+                                                                      isEnabled: !isFavoritePath(entry.path),
+                                                                      systemImageName: "star"),
+                                            contextMenuSeparator(id: "directory-separator"),
+                                            OuterframeContextMenuItem(id: "paste",
+                                                                      title: "Paste",
+                                                                      action: .standardPaste,
+                                                                      isEnabled: true,
+                                                                      systemImageName: "clipboard")
                                            ],
                                            at: point)
             return
@@ -1045,17 +1102,23 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 guard let self else { return }
                 let menuID = UUID()
                 var items = [
+                    self.contextMenuLabel(id: "file-heading", title: entry.name),
                     OuterframeContextMenuItem(id: "copy",
                                               title: "Copy",
-                                              action: .standardCopy)
+                                              action: .standardCopy,
+                                              isEnabled: true,
+                                              systemImageName: "doc.on.doc")
                 ]
                 if !openers.isEmpty {
                     self.pendingOpenMenuEntries[menuID] = (entry, openers)
+                    items.append(self.contextMenuSeparator(id: "openers-separator"))
+                    items.append(self.contextMenuLabel(id: "openers-heading", title: "Open With"))
                     for (index, opener) in openers.enumerated() {
                         let title = opener.displayName.isEmpty ? opener.serviceID : opener.displayName
                         items.append(OuterframeContextMenuItem(id: "open-\(index)",
-                                                               title: "Open in \(title)",
-                                                               isEnabled: true))
+                                                               title: title,
+                                                               isEnabled: true,
+                                                               systemImageName: "arrow.up.forward"))
                     }
                 }
                 self.outerframeHost.showContextMenu(menuID: menuID,
@@ -1067,9 +1130,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         outerframeHost.showContextMenu(menuID: UUID(),
                                        items: [
+                                        contextMenuLabel(id: "folder-heading", title: currentPath),
                                         OuterframeContextMenuItem(id: "paste",
                                                                   title: "Paste",
-                                                                  action: .standardPaste)
+                                                                  action: .standardPaste,
+                                                                  isEnabled: true,
+                                                                  systemImageName: "clipboard")
                                        ],
                                        at: point)
     }
@@ -1079,15 +1145,18 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
            itemID.hasPrefix("open-"),
            let index = Int(itemID.dropFirst("open-".count)),
            pending.openers.indices.contains(index) {
-            openFile(entry: pending.entry, with: pending.openers[index])
+            navigateToFile(entry: pending.entry, with: pending.openers[index])
             return
         }
 
-        guard itemID == "add-to-favorites",
-              let entry = pendingFavoriteMenuEntries.removeValue(forKey: menuID) else {
+        guard let entry = pendingDirectoryMenuEntries.removeValue(forKey: menuID) else {
             return
         }
-        addFavorite(entry)
+        if itemID == "open-directory" {
+            openDirectory(path: entry.path)
+        } else if itemID == "add-to-favorites" {
+            addFavorite(entry)
+        }
     }
 
     private func openFileWithDefaultOpener(_ entry: FileEntry) {
@@ -1111,19 +1180,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
         statusLayer.string = ""
         outerframeHost.navigate(to: url)
-    }
-
-    private func openFile(entry: FileEntry, with opener: FileOpener) {
-        guard !entry.isDirectory,
-              let url = openerNavigationURL(opener) else {
-            statusLayer.string = "Could not open \(entry.name)"
-            return
-        }
-        let title = opener.displayName.isEmpty ? opener.serviceID : opener.displayName
-        statusLayer.string = ""
-        outerframeHost.openNewWindow(with: url,
-                                     displayString: title,
-                                     preferredSize: CGSize(width: 900, height: 650))
     }
 
     private func fetchOpeners(for entry: FileEntry, completion: @escaping @MainActor ([FileOpener]) -> Void) {
@@ -1263,14 +1319,14 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         openers.reserveCapacity(rowCount)
         for index in 0..<rowCount {
             var row = BinaryPayloadCursor(data, offset: rowsOffset + index * FileOpenersBinaryFormat.rowSize)
-            guard let extensionName = row.readStringReference(),
+            guard let contentType = row.readStringReference(),
                   let serviceID = row.readStringReference(),
                   let displayName = row.readStringReference(),
                   let socketPath = row.readStringReference(),
                   let url = row.readStringReference() else {
                 return nil
             }
-            openers.append(FileOpener(extensionName: extensionName,
+            openers.append(FileOpener(contentType: contentType,
                                       serviceID: serviceID,
                                       displayName: displayName,
                                       socketPath: socketPath,

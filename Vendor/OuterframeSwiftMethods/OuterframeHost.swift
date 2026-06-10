@@ -317,10 +317,12 @@ final class OuterframeHost: SocketToBrowserDelegate {
 
     // MARK: - Pasteboard
 
-    func setEditingCapabilities(canCopy: Bool, canCut: Bool) {
+    func sendEditCommandValidationResponse(requestID: UUID, enabledCommands: OuterframeEditCommandSet) {
         Task {
-            try? await socket.send(ContentToBrowserMessage.setEditingCapabilities(canCopy: canCopy,
-                                                                                  canCut: canCut).encode())
+            try? await socket.send(ContentToBrowserMessage.editCommandValidationResponse(
+                requestID: requestID,
+                enabledCommands: enabledCommands
+            ).encode())
         }
     }
 
@@ -404,11 +406,11 @@ final class OuterframeHost: SocketToBrowserDelegate {
         }
     }
 
-    // MARK: - Text Cursor
+    // MARK: - Text Input Geometry
 
-    func sendTextCursorUpdate(cursors: [OuterContentTextCursorSnapshot]) {
+    func sendTextInputGeometryUpdate(_ geometry: OuterContentTextInputGeometry?) {
         Task {
-            try? await socket.send(ContentToBrowserMessage.textCursorUpdate(cursors: cursors).encode())
+            try? await socket.send(ContentToBrowserMessage.textInputGeometryUpdate(geometry: geometry).encode())
         }
     }
 
@@ -834,15 +836,4 @@ struct OuterframeContentInputMode: OptionSet, Sendable {
 
     var allowsTextInput: Bool { contains(.textInput) }
     var allowsRawKeys: Bool { contains(.rawKeys) }
-}
-
-/// Describes whether the plugin can currently satisfy copy/cut commands.
-struct OuterframeContentEditingCapabilities: Sendable {
-    var canCopy: Bool
-    var canCut: Bool
-
-    init(canCopy: Bool, canCut: Bool) {
-        self.canCopy = canCopy
-        self.canCut = canCut
-    }
 }
