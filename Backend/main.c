@@ -38,7 +38,7 @@ static const char *kBundleFilePathMacosX86 = "bundles/FilesContent.bundle.macos-
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
-static char g_backend_label[256] = "dev.outergroup.Files";
+static char g_backend_label[256] = "org.outershell.Files";
 static char g_outershelld_api_socket_path[PATH_MAX] = "";
 static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
@@ -749,7 +749,7 @@ static void expand_tilde_path(const char *path, char *out, size_t out_size) {
 }
 
 static void default_socket_path(char *out, size_t out_size) {
-    const char *label = g_backend_label[0] ? g_backend_label : "dev.outergroup.Files";
+    const char *label = g_backend_label[0] ? g_backend_label : "org.outershell.Files";
 #ifdef __APPLE__
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     if (runtime_dir && runtime_dir[0]) {

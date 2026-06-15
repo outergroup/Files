@@ -50,4 +50,4 @@ echo "  ${BUILD_ROOT}/${CONFIGURATION}/FilesBackend"
 echo "  ${RUN_ROOT}/bundles"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/FilesBackend\" --label dev.outergroup.Files --bundles-dir \"${RUN_ROOT}/bundles\" --icon-file \"${SCRIPT_DIR}/app-icon.png\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/FilesBackend\" --label org.outershell.Files --bundles-dir \"${RUN_ROOT}/bundles\" --icon-file \"${SCRIPT_DIR}/app-icon.png\""
