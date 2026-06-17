@@ -1281,26 +1281,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
-    private var contextMenuSectionLabelStyle: OuterframeContextMenuItemStyle {
-        OuterframeContextMenuItemStyle(height: 23,
-                                       topInset: 4,
-                                       leftInset: 16,
-                                       bottomInset: 4,
-                                       rightInset: 8,
-                                       fontSize: 11,
-                                       fontWeight: Float32(NSFont.Weight.semibold.rawValue),
-                                       textColorRGBA: 0,
-                                       alignment: .left)
-    }
-
-    private func contextMenuLabel(id: String, title: String) -> OuterframeContextMenuItem {
-        OuterframeContextMenuItem(id: id,
-                                  title: title,
-                                  kind: .label,
-                                  isEnabled: false,
-                                  style: contextMenuSectionLabelStyle)
-    }
-
     private func contextMenuSeparator(id: String) -> OuterframeContextMenuItem {
         OuterframeContextMenuItem(id: id,
                                   title: "",
@@ -1320,7 +1300,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             pendingDirectoryMenuEntries[menuID] = entry
             outerframeHost.showContextMenu(menuID: menuID,
                                            items: [
-                                            contextMenuLabel(id: "directory-heading", title: entry.name),
                                             OuterframeContextMenuItem(id: "open-directory",
                                                                       title: "Open",
                                                                       isEnabled: true,
@@ -1348,18 +1327,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             fetchOpeners(for: entry) { [weak self] openers in
                 guard let self else { return }
                 let menuID = UUID()
-                var items = [
-                    self.contextMenuLabel(id: "file-heading", title: entry.name),
-                    OuterframeContextMenuItem(id: "copy",
-                                              title: "Copy",
-                                              action: .standardCopy,
-                                              isEnabled: true,
-                                              systemImageName: "doc.on.doc")
-                ]
+                var items: [OuterframeContextMenuItem] = []
                 if !openers.isEmpty {
                     self.pendingOpenMenuEntries[menuID] = (entry, openers)
-                    items.append(self.contextMenuSeparator(id: "openers-separator"))
-                    items.append(self.contextMenuLabel(id: "openers-heading", title: "Open With"))
                     let duplicateOpenerTitles = self.duplicateOpenerBaseTitles(openers)
                     for (index, opener) in openers.enumerated() {
                         let title = self.contextMenuTitle(for: opener,
@@ -1369,7 +1339,13 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                                isEnabled: true,
                                                                systemImageName: "arrow.up.forward"))
                     }
+                    items.append(self.contextMenuSeparator(id: "copy-separator"))
                 }
+                items.append(OuterframeContextMenuItem(id: "copy",
+                                                       title: "Copy",
+                                                       action: .standardCopy,
+                                                       isEnabled: true,
+                                                       systemImageName: "doc.on.doc"))
                 self.outerframeHost.showContextMenu(menuID: menuID,
                                                     items: items,
                                                     at: point)
@@ -1379,7 +1355,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         outerframeHost.showContextMenu(menuID: UUID(),
                                        items: [
-                                        contextMenuLabel(id: "folder-heading", title: currentPath),
                                         OuterframeContextMenuItem(id: "paste",
                                                                   title: "Paste",
                                                                   action: .standardPaste,
@@ -1414,7 +1389,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         } else {
             qualifiedTitle = baseTitle
         }
-        return "Open in \"\(qualifiedTitle)\""
+        return "Open with \"\(qualifiedTitle)\""
     }
 
     private func handleContextMenuItemSelected(menuID: UUID, itemID: String) {
