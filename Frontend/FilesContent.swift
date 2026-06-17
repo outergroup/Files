@@ -332,6 +332,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var accessibilityNotificationScheduled = false
     private var typeaheadPrefix = ""
     private var typeaheadLastUpdated: Date?
+    private var suppressNextMouseUpAfterControlClick = false
 
     private let favoritesBarHeight: CGFloat = 36
     private let breadcrumbBarHeight: CGFloat = 34
@@ -390,14 +391,24 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
             setRowsScroll(scrollOffset - delta.y * multiplier)
 
-        case .mouseDown(let point, _, let clickCount):
-            handleMouseDown(at: point, clickCount: clickCount)
+        case .mouseDown(let point, let modifierFlags, let clickCount):
+            if modifierFlags.contains(.control) {
+                suppressNextMouseUpAfterControlClick = true
+                handleRightMouseDown(at: point)
+            } else {
+                suppressNextMouseUpAfterControlClick = false
+                handleMouseDown(at: point, clickCount: clickCount)
+            }
 
         case .mouseDragged(let point, let modifierFlags):
             handleMouseDragged(to: point, modifierFlags: modifierFlags)
 
         case .mouseUp(let point, _):
-            handleMouseUp(at: point)
+            if suppressNextMouseUpAfterControlClick {
+                suppressNextMouseUpAfterControlClick = false
+            } else {
+                handleMouseUp(at: point)
+            }
 
         case .rightMouseDown(let point, _, _):
             handleRightMouseDown(at: point)
