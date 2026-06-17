@@ -32,6 +32,11 @@ private struct FileEntry: Sendable {
     let mode: String
 }
 
+private struct DragPreview {
+    let pngData: Data
+    let size: CGSize
+}
+
 private struct FileOpener: Sendable {
     let contentType: String
     let serviceID: String
@@ -1057,7 +1062,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         dragStartedForSelectionIndex = selectedIndex
-        beginDraggingFilePromise(for: entry)
+        beginDraggingFilePromise(for: entry, at: selectedIndex)
     }
 
     private func handleMouseUp(at point: CGPoint) {
@@ -1684,7 +1689,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         return favoriteLocations.contains { $0.path == path }
     }
 
-    private func beginDraggingFilePromise(for entry: FileEntry) {
+    private func beginDraggingFilePromise(for entry: FileEntry, at index: Int) {
         guard outerframeHost.stagedFileDirectoryURL != nil else {
             dragStartedForSelectionIndex = nil
             statusLayer.string = "Could not prepare drag"
@@ -1694,15 +1699,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         let promiseID = UUID()
         filePromiseEntries[promiseID] = entry
-        outerframeHost.beginDraggingFilePromise(
-            promiseID: promiseID,
-            name: entry.name,
-            fileSize: entry.isDirectory ? nil : entry.size,
-            fileType: fileTypeIdentifier(for: entry),
-            operationMask: .copy,
-            previewPNGData: dragPreviewImageData(for: entry),
-            previewSize: CGSize(width: 220, height: 64)
-        )
+        let dragPreview = dragPreview(for: entry)
+        guard let pasteboardItem = outerframeHost.filePromisePasteboardItem(promiseID: promiseID,
+                                                                            name: entry.name,
+                                                                            fileSize: entry.isDirectory ? nil : entry.size,
+                                                                            fileType: fileTypeIdentifier(for: entry)) else {
+            filePromiseEntries.removeValue(forKey: promiseID)
+            dragStartedForSelectionIndex = nil
+            statusLayer.string = "Could not prepare drag"
+            return
+        }
+        outerframeHost.beginDraggingPasteboardItem(pasteboardItem,
+                                                   operationMask: .copy,
+                                                   previewPNGData: dragPreview?.pngData,
+                                                   previewSize: dragPreview?.size,
+                                                   previewFrameOrigin: dragPreviewOrigin(forRowAt: index))
     }
 
     private func handleFilePromiseWriteRequest(requestID: UUID, promiseID: UUID) {
@@ -1965,13 +1976,42 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
 
-    private func dragPreviewImageData(for entry: FileEntry) -> Data? {
+    private func dragPreviewOrigin(forRowAt index: Int) -> CGPoint {
+        let contentHeight = CGFloat(entries.count) * rowHeight
+        let rowY = contentHeight - CGFloat(index + 1) * rowHeight
+        let rowInRowsClip = CGRect(x: 0,
+                                   y: rowsContentLayer.frame.minY + rowY,
+                                   width: rowsClipLayer.bounds.width,
+                                   height: rowHeight)
+        let rowInRoot = rowsClipLayer.convert(rowInRowsClip, to: rootLayer)
+        return CGPoint(x: rowInRoot.minX + horizontalInset,
+                       y: rowInRoot.minY)
+    }
+
+    private func dragPreview(for entry: FileEntry) -> DragPreview? {
         let scale = NSScreen.main?.backingScaleFactor ?? 2
-        let width: CGFloat = 220
-        let height: CGFloat = 64
+        let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        let contentWidth = max(rowsClipLayer.bounds.width - horizontalInset * 2, 1)
+        let nameWidth = max(floor(contentWidth * nameColumnWidth) - 24, 1)
+        let measuredNameWidth = ceil((entry.name as NSString).size(withAttributes: [.font: font]).width)
+        let textWidth = min(max(measuredNameWidth, 1), max(nameWidth, 1))
+        let selectionPaddingX: CGFloat = 5
+        let iconSize = CGSize(width: 16, height: 16)
+        let iconX: CGFloat = 0
+        let iconY: CGFloat = 5
+        let labelX: CGFloat = 24
+        let labelY: CGFloat = 5
+        let selectionFrame = NSRect(x: labelX - selectionPaddingX,
+                                    y: 3,
+                                    width: textWidth + selectionPaddingX * 2,
+                                    height: 20)
+        let width = ceil(selectionFrame.maxX + 2)
+        let height = rowHeight
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
-                                            pixelsWide: Int(width * scale),
-                                            pixelsHigh: Int(height * scale),
+                                            pixelsWide: max(Int(ceil(width * scale)), 1),
+                                            pixelsHigh: max(Int(ceil(height * scale)), 1),
                                             bitsPerSample: 8,
                                             samplesPerPixel: 4,
                                             hasAlpha: true,
@@ -1990,41 +2030,34 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             NSGraphicsContext.restoreGraphicsState()
         }
 
-        let rect = NSRect(x: 0, y: 0, width: width, height: height)
-        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
-        NSColor.separatorColor.withAlphaComponent(0.35).setStroke()
-        NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).stroke()
+        appearance.performAsCurrentDrawingAppearance {
+            NSColor.clear.setFill()
+            NSBezierPath(rect: NSRect(x: 0, y: 0, width: width, height: height)).fill()
 
-        let sourceIcon = entry.isDirectory ? NSWorkspace.shared.icon(for: UTType.folder) : fileIcon(for: entry.name)
-        let icon = sourceIcon.copy() as? NSImage ?? sourceIcon
-        icon.size = NSSize(width: 38, height: 38)
-        icon.draw(in: NSRect(x: 14, y: 13, width: 38, height: 38))
+            if let cgImage = rowIconCGImage(for: entry, size: iconSize) {
+                let icon = NSImage(cgImage: cgImage, size: iconSize)
+                icon.draw(in: NSRect(x: iconX, y: iconY, width: iconSize.width, height: iconSize.height))
+            }
 
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byTruncatingMiddle
-        let titleAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: paragraph
-        ]
-        let subtitleAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: paragraph
-        ]
+            NSColor.controlAccentColor.setFill()
+            NSBezierPath(roundedRect: selectionFrame, xRadius: 4, yRadius: 4).fill()
 
-        (entry.name as NSString).draw(in: NSRect(x: 64, y: 34, width: 142, height: 17),
-                                      withAttributes: titleAttributes)
+            let titleAttributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph
+            ]
+            (entry.name as NSString).draw(in: NSRect(x: labelX,
+                                                     y: labelY,
+                                                     width: textWidth,
+                                                     height: 17),
+                                          withAttributes: titleAttributes)
+        }
 
-        let previewExtension = URL(fileURLWithPath: entry.name).pathExtension.uppercased()
-        let subtitle = entry.isDirectory
-            ? "Folder"
-            : "\(formatByteCount(entry.size)) - \(previewExtension.isEmpty ? "File" : previewExtension)"
-        (subtitle as NSString).draw(in: NSRect(x: 64, y: 15, width: 142, height: 15),
-                                    withAttributes: subtitleAttributes)
-
-        return bitmap.representation(using: .png, properties: [:])
+        guard let data = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+        return DragPreview(pngData: data, size: CGSize(width: width, height: height))
     }
 
     private func rowIndex(at point: CGPoint) -> Int {
