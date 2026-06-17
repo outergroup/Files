@@ -309,6 +309,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var reusableRowLayers: [CALayer] = []
     private var pendingDirectoryMenuEntries: [UUID: FileEntry] = [:]
     private var pendingOpenMenuEntries: [UUID: (entry: FileEntry, openers: [FileOpener])] = [:]
+    private var resizeLayoutUpdateScheduled = false
     private var accessibilityNotificationScheduled = false
     private var typeaheadPrefix = ""
     private var typeaheadLastUpdated: Date?
@@ -359,8 +360,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         case .resizeContent(let size):
             currentSize = size
-            clampScrollOffset()
-            updateLayout()
+            scheduleResizeLayoutUpdate()
 
         case .systemAppearanceUpdate(let appearance):
             self.appearance = appearance
@@ -514,6 +514,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             updateRows(rebuild: true)
         }
         notifyAccessibilityLayoutChanged()
+    }
+
+    private func scheduleResizeLayoutUpdate() {
+        guard !resizeLayoutUpdateScheduled else { return }
+        resizeLayoutUpdateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.resizeLayoutUpdateScheduled = false
+            self.updateLayout()
+        }
     }
 
     private func updateColors() {
