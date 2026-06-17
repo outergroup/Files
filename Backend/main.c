@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
 #include <poll.h>
 #include <pwd.h>
@@ -59,7 +60,21 @@ typedef struct {
     uint64_t size;
     double modified;
     mode_t mode;
+    uint32_t access_flags;
 } FileEntry;
+
+enum {
+    FILE_ENTRY_ACCESS_USER_READ = 1u << 0,
+    FILE_ENTRY_ACCESS_USER_WRITE = 1u << 1
+};
+
+typedef struct {
+    bool resolved;
+    uid_t uid;
+    gid_t primary_gid;
+    gid_t *groups;
+    int group_count;
+} RequesterAccessContext;
 
 static bool query_value(const char *query, const char *name, char *dst, size_t dst_size);
 static void resolve_requested_path(const char *requested, char *resolved, size_t resolved_size);
@@ -294,7 +309,7 @@ enum {
     FILE_PATH_REQUEST_BINARY_MAGIC = 0x51465046u,
     FILE_MKDIR_REQUEST_BINARY_MAGIC = 0x51444d46u,
     FILE_LIST_BINARY_MAGIC = 0x534c4646u,
-    FILE_LIST_BINARY_VERSION = 1,
+    FILE_LIST_BINARY_VERSION = 2,
     FILE_LIST_BINARY_HEADER_SIZE = 48,
     FILE_LIST_BINARY_ROW_SIZE = 48,
     FILE_OPENERS_BINARY_MAGIC = 0x504f464fu,
@@ -909,6 +924,122 @@ static int compare_entries(const void *lhs, const void *rhs) {
     return strcasecmp(a->name, b->name);
 }
 
+static void requester_access_context_destroy(RequesterAccessContext *context) {
+    if (!context) return;
+    free(context->groups);
+    context->groups = NULL;
+    context->group_count = 0;
+}
+
+static void requester_access_context_init(RequesterAccessContext *context, const char *requester_user) {
+    if (!context) return;
+    memset(context, 0, sizeof(*context));
+
+    struct passwd *pw = NULL;
+    if (requester_user && requester_user[0]) {
+        pw = getpwnam(requester_user);
+    }
+    if (!pw) {
+        pw = getpwuid(getuid());
+    }
+    if (!pw) {
+        return;
+    }
+
+    context->resolved = true;
+    context->uid = pw->pw_uid;
+    context->primary_gid = pw->pw_gid;
+
+#ifdef __APPLE__
+    int group_count = 64;
+    int stack_groups[64];
+    int *groups = stack_groups;
+    if (getgrouplist(pw->pw_name, (int)pw->pw_gid, groups, &group_count) < 0) {
+        groups = calloc((size_t)group_count, sizeof(int));
+        if (!groups) {
+            context->group_count = 0;
+            return;
+        }
+        if (getgrouplist(pw->pw_name, (int)pw->pw_gid, groups, &group_count) < 0) {
+            free(groups);
+            context->group_count = 0;
+            return;
+        }
+    }
+    context->groups = calloc((size_t)group_count, sizeof(gid_t));
+    if (context->groups) {
+        for (int i = 0; i < group_count; i++) {
+            context->groups[i] = (gid_t)groups[i];
+        }
+        context->group_count = group_count;
+    }
+    if (groups != stack_groups) {
+        free(groups);
+    }
+#else
+    int group_count = 64;
+    gid_t stack_groups[64];
+    gid_t *groups = stack_groups;
+    if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &group_count) < 0) {
+        groups = calloc((size_t)group_count, sizeof(gid_t));
+        if (!groups) {
+            context->group_count = 0;
+            return;
+        }
+        if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &group_count) < 0) {
+            free(groups);
+            context->group_count = 0;
+            return;
+        }
+    }
+    context->groups = calloc((size_t)group_count, sizeof(gid_t));
+    if (context->groups) {
+        memcpy(context->groups, groups, (size_t)group_count * sizeof(gid_t));
+        context->group_count = group_count;
+    }
+    if (groups != stack_groups) {
+        free(groups);
+    }
+#endif
+}
+
+static bool requester_access_context_contains_gid(const RequesterAccessContext *context, gid_t gid) {
+    if (!context || !context->resolved) return false;
+    if (context->primary_gid == gid) return true;
+    for (int i = 0; i < context->group_count; i++) {
+        if (context->groups[i] == gid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t requester_access_flags_for_stat(const RequesterAccessContext *context, const struct stat *st) {
+    if (!context || !context->resolved || !st) return 0;
+
+    if (context->uid == 0) {
+        return FILE_ENTRY_ACCESS_USER_READ | FILE_ENTRY_ACCESS_USER_WRITE;
+    }
+
+    mode_t read_bit;
+    mode_t write_bit;
+    if (context->uid == st->st_uid) {
+        read_bit = S_IRUSR;
+        write_bit = S_IWUSR;
+    } else if (requester_access_context_contains_gid(context, st->st_gid)) {
+        read_bit = S_IRGRP;
+        write_bit = S_IWGRP;
+    } else {
+        read_bit = S_IROTH;
+        write_bit = S_IWOTH;
+    }
+
+    uint32_t flags = 0;
+    if ((st->st_mode & read_bit) != 0) flags |= FILE_ENTRY_ACCESS_USER_READ;
+    if ((st->st_mode & write_bit) != 0) flags |= FILE_ENTRY_ACCESS_USER_WRITE;
+    return flags;
+}
+
 static bool append_file_list_entry_row(StringBuilder *rows,
                                        StringBuilder *variable,
                                        const FileEntry *entry) {
@@ -919,12 +1050,12 @@ static bool append_file_list_entry_row(StringBuilder *rows,
            append_binary_string_ref(rows, variable, entry->path) &&
            append_binary_string_ref(rows, variable, mode) &&
            sb_append_u32_le(rows, entry->is_directory ? 1u : 0u) &&
-           sb_append_u32_le(rows, 0) &&
+           sb_append_u32_le(rows, entry->access_flags) &&
            sb_append_u64_le(rows, entry->size) &&
            sb_append_u64_le(rows, modified_millis);
 }
 
-static void send_files_response_for_path(int fd, const char *requested) {
+static void send_files_response_for_path(int fd, const char *requested, const char *requester_user) {
     char path[PATH_MAX];
     resolve_requested_path(requested, path, sizeof(path));
 
@@ -935,6 +1066,9 @@ static void send_files_response_for_path(int fd, const char *requested) {
         send_text_response(fd, 404, message);
         return;
     }
+
+    RequesterAccessContext access_context;
+    requester_access_context_init(&access_context, requester_user);
 
     FileEntry *entries = NULL;
     size_t count = 0;
@@ -949,6 +1083,7 @@ static void send_files_response_for_path(int fd, const char *requested) {
             FileEntry *new_entries = realloc(entries, new_capacity * sizeof(FileEntry));
             if (!new_entries) {
                 free(entries);
+                requester_access_context_destroy(&access_context);
                 closedir(dir);
                 send_text_response(fd, 500, "out of memory\n");
                 return;
@@ -972,9 +1107,11 @@ static void send_files_response_for_path(int fd, const char *requested) {
         file->size = (uint64_t)st.st_size;
         file->modified = (double)st.st_mtime;
         file->mode = st.st_mode;
+        file->access_flags = requester_access_flags_for_stat(&access_context, &st);
         count++;
     }
     closedir(dir);
+    requester_access_context_destroy(&access_context);
 
     qsort(entries, count, sizeof(FileEntry), compare_entries);
 
@@ -1033,12 +1170,12 @@ static void send_files_response_for_path(int fd, const char *requested) {
     free(response.data);
 }
 
-static void send_files_response(int fd, const char *query) {
+static void send_files_response(int fd, const char *query, const char *requester_user) {
     char requested[PATH_MAX];
     if (!query_value(query, "path", requested, sizeof(requested))) {
         requested[0] = '\0';
     }
-    send_files_response_for_path(fd, requested);
+    send_files_response_for_path(fd, requested, requester_user);
 }
 
 static void send_download_response(int fd, const char *query) {
@@ -1294,7 +1431,7 @@ static void handle_client(int fd) {
                 send_text_response(fd, 400, "bad files request\n");
                 return;
             }
-            send_files_response_for_path(fd, requested);
+            send_files_response_for_path(fd, requested, requester_user);
             free(body);
             return;
         }
@@ -1340,7 +1477,7 @@ static void handle_client(int fd) {
         const char *path = g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86;
         send_bundle_file(fd, path);
     } else if (strcmp(target, "/api/files") == 0) {
-        send_files_response(fd, query);
+        send_files_response(fd, query, requester_user);
     } else if (strcmp(target, "/api/openers") == 0) {
         send_openers_response(fd, query, requester_user);
     } else if (strcmp(target, "/api/download") == 0) {

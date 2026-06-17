@@ -30,6 +30,15 @@ private struct FileEntry: Sendable {
     let size: UInt64
     let modified: Double
     let mode: String
+    let accessFlags: UInt32
+
+    var userCanView: Bool {
+        (accessFlags & 1) != 0
+    }
+
+    var userCanModify: Bool {
+        (accessFlags & 2) != 0
+    }
 }
 
 private struct DragPreview {
@@ -44,6 +53,11 @@ private struct FileOpener: Sendable {
     let socketPath: String
     let url: String
     let ownerName: String
+}
+
+private struct FileOpenMenuAction {
+    let title: String
+    let opener: FileOpener
 }
 
 private enum FileOpenersBinaryFormat {
@@ -66,7 +80,7 @@ private enum FileMkdirRequestBinaryFormat {
 
 private enum FileListBinaryFormat {
     static let magic: UInt32 = 0x534c4646
-    static let version: UInt32 = 1
+    static let version: UInt32 = 2
     static let headerSize = 48
     static let rowSize = 48
 }
@@ -1338,14 +1352,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 guard let self else { return }
                 let menuID = UUID()
                 var items: [OuterframeContextMenuItem] = []
-                if !openers.isEmpty {
-                    self.pendingOpenMenuEntries[menuID] = (entry, openers)
-                    let duplicateOpenerTitles = self.duplicateOpenerBaseTitles(openers)
-                    for (index, opener) in openers.enumerated() {
-                        let title = self.contextMenuTitle(for: opener,
-                                                          duplicateBaseTitles: duplicateOpenerTitles)
+                let openerActions = self.openMenuActions(for: entry, openers: openers)
+                if !openerActions.isEmpty {
+                    self.pendingOpenMenuEntries[menuID] = (entry, openerActions.map(\.opener))
+                    for (index, action) in openerActions.enumerated() {
                         items.append(OuterframeContextMenuItem(id: "open-\(index)",
-                                                               title: title,
+                                                               title: action.title,
                                                                isEnabled: true,
                                                                systemImageName: "arrow.up.forward"))
                     }
@@ -1390,16 +1402,74 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         return Set(counts.compactMap { title, count in count > 1 ? title : nil })
     }
 
-    private func contextMenuTitle(for opener: FileOpener, duplicateBaseTitles: Set<String>) -> String {
+    private func qualifiedOpenerTitle(for opener: FileOpener, forceOwner: Bool) -> String {
         let baseTitle = openerBaseTitle(opener)
         let ownerName = opener.ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let qualifiedTitle: String
-        if duplicateBaseTitles.contains(baseTitle), !ownerName.isEmpty {
-            qualifiedTitle = "\(ownerName) / \(baseTitle)"
-        } else {
-            qualifiedTitle = baseTitle
+        if forceOwner, !ownerName.isEmpty {
+            return "\(ownerName) / \(baseTitle)"
         }
-        return "Open with \"\(qualifiedTitle)\""
+        return baseTitle
+    }
+
+    private func isRootOpener(_ opener: FileOpener) -> Bool {
+        opener.ownerName.trimmingCharacters(in: .whitespacesAndNewlines) == "root"
+    }
+
+    private func isSameOpener(_ lhs: FileOpener, _ rhs: FileOpener) -> Bool {
+        lhs.serviceID == rhs.serviceID &&
+        lhs.socketPath == rhs.socketPath &&
+        lhs.url == rhs.url &&
+        lhs.ownerName == rhs.ownerName
+    }
+
+    private func openMenuActions(for entry: FileEntry, openers: [FileOpener]) -> [FileOpenMenuAction] {
+        guard !openers.isEmpty else { return [] }
+
+        var groupedOpeners: [String: [FileOpener]] = [:]
+        var groupOrder: [String] = []
+        for opener in openers {
+            let baseTitle = openerBaseTitle(opener)
+            if groupedOpeners[baseTitle] == nil {
+                groupOrder.append(baseTitle)
+            }
+            groupedOpeners[baseTitle, default: []].append(opener)
+        }
+
+        let duplicateBaseTitles = duplicateOpenerBaseTitles(openers)
+        var actions: [FileOpenMenuAction] = []
+        for baseTitle in groupOrder {
+            guard let group = groupedOpeners[baseTitle] else { continue }
+            let rootOpener = group.first(where: { isRootOpener($0) })
+            let userOpener = group.first(where: { !isRootOpener($0) })
+
+            if let rootOpener, let userOpener {
+                if entry.userCanModify {
+                    actions.append(FileOpenMenuAction(title: "Open in \(baseTitle)",
+                                                      opener: userOpener))
+                } else if entry.userCanView {
+                    actions.append(FileOpenMenuAction(title: "View in \(baseTitle)",
+                                                      opener: userOpener))
+                    actions.append(FileOpenMenuAction(title: "Edit in \(baseTitle) (root)",
+                                                      opener: rootOpener))
+                } else {
+                    actions.append(FileOpenMenuAction(title: "Open in \(baseTitle)",
+                                                      opener: rootOpener))
+                }
+
+                for opener in group where !isSameOpener(opener, rootOpener) && !isSameOpener(opener, userOpener) {
+                    let title = qualifiedOpenerTitle(for: opener, forceOwner: duplicateBaseTitles.contains(baseTitle))
+                    actions.append(FileOpenMenuAction(title: "Open in \(title)",
+                                                      opener: opener))
+                }
+            } else {
+                for opener in group {
+                    let title = qualifiedOpenerTitle(for: opener, forceOwner: duplicateBaseTitles.contains(baseTitle))
+                    actions.append(FileOpenMenuAction(title: "Open in \(title)",
+                                                      opener: opener))
+                }
+            }
+        }
+        return actions
     }
 
     private func handleContextMenuItemSelected(menuID: UUID, itemID: String) {
@@ -1426,7 +1496,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         statusLayer.string = ""
         fetchOpeners(for: entry) { [weak self] openers in
             guard let self else { return }
-            guard let opener = openers.first else {
+            guard let opener = self.openMenuActions(for: entry, openers: openers).first?.opener else {
                 self.statusLayer.string = "No app found for \(entry.name)"
                 return
             }
@@ -1538,7 +1608,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                   let path = row.readStringReference(),
                   let mode = row.readStringReference(),
                   let isDirectoryValue = row.readUInt32(),
-                  row.readUInt32() != nil,
+                  let accessFlags = row.readUInt32(),
                   let size = row.readUInt64(),
                   let modifiedMillis = row.readUInt64() else {
                 throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError)
@@ -1548,7 +1618,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                      isDirectory: isDirectoryValue != 0,
                                      size: size,
                                      modified: Double(modifiedMillis) / 1000.0,
-                                     mode: mode))
+                                     mode: mode,
+                                     accessFlags: accessFlags))
         }
         return FileListResponse(path: path, parent: parent.isEmpty ? nil : parent, entries: entries)
     }
