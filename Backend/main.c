@@ -299,9 +299,10 @@ enum {
     FILE_LIST_BINARY_ROW_SIZE = 48,
     FILE_OPENERS_BINARY_MAGIC = 0x504f464fu,
     FILE_OPENERS_REQUEST_BINARY_MAGIC = 0x514f464fu,
-    FILE_OPENERS_BINARY_VERSION = 1,
+    FILE_OPENERS_BINARY_VERSION = 2,
     FILE_OPENERS_BINARY_HEADER_SIZE = 32,
-    FILE_OPENERS_BINARY_ROW_SIZE = 40
+    FILE_OPENERS_API_ROW_SIZE = 40,
+    FILE_OPENERS_BINARY_ROW_SIZE = 48
 };
 
 enum {
@@ -550,12 +551,14 @@ static bool send_outerctl_invoke_to_outershelld(const char *const *arguments, si
 
 static bool query_file_openers_from_outershelld(const char *path,
                                                 const char *content_type,
+                                                const char *requester_user,
                                                 StringBuilder *response) {
     StringBuilder message = {0};
     bool ok = sb_append_u16_le(&message, OUTERSHELLD_API_FILE_OPENERS_QUERY) &&
-              sb_append_zero(&message, 16) &&
+              sb_append_zero(&message, 24) &&
               api_message_append_string_ref_at(&message, 2, path) &&
-              api_message_append_string_ref_at(&message, 10, content_type ? content_type : "");
+              api_message_append_string_ref_at(&message, 10, content_type ? content_type : "") &&
+              api_message_append_string_ref_at(&message, 18, requester_user ? requester_user : "");
     ok = ok && send_outershelld_api_message(&message, response);
     free(message.data);
     return ok;
@@ -573,7 +576,25 @@ static void send_empty_openers_response(int fd) {
     send_response(fd, 200, "OK", "application/octet-stream", header, sizeof(header));
 }
 
-static void send_openers_response_for_path(int fd, const char *requested) {
+static void opener_owner_name_for_socket_path(const char *socket_path, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!socket_path || !socket_path[0]) return;
+
+    struct stat st;
+    if (stat(socket_path, &st) != 0) return;
+
+    struct passwd *pw = getpwuid(st.st_uid);
+    if (pw && pw->pw_name && pw->pw_name[0]) {
+        snprintf(out, out_size, "%s", pw->pw_name);
+        return;
+    }
+    snprintf(out, out_size, "%u", (unsigned int)st.st_uid);
+}
+
+static void send_openers_response_for_path(int fd,
+                                           const char *requested,
+                                           const char *requester_user) {
     char path[PATH_MAX];
     resolve_requested_path(requested, path, sizeof(path));
     if (!g_outershelld_api_socket_path[0]) {
@@ -582,7 +603,7 @@ static void send_openers_response_for_path(int fd, const char *requested) {
     }
 
     StringBuilder api_response = {0};
-    if (!query_file_openers_from_outershelld(path, "", &api_response) ||
+    if (!query_file_openers_from_outershelld(path, "", requester_user, &api_response) ||
         api_response.length < OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE ||
         read_u16_le_from_bytes((const unsigned char *)api_response.data, 0) != OUTERSHELLD_API_FILE_OPENERS_RESPONSE ||
         read_u32_le_from_bytes((const unsigned char *)api_response.data, 2) != 0) {
@@ -592,7 +613,7 @@ static void send_openers_response_for_path(int fd, const char *requested) {
     }
 
     uint32_t api_row_count = read_u32_le_from_bytes((const unsigned char *)api_response.data, 14);
-    if (api_row_count > (api_response.length - OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE) / FILE_OPENERS_BINARY_ROW_SIZE) {
+    if (api_row_count > (api_response.length - OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE) / FILE_OPENERS_API_ROW_SIZE) {
         free(api_response.data);
         send_empty_openers_response(fd);
         return;
@@ -604,12 +625,32 @@ static void send_openers_response_for_path(int fd, const char *requested) {
     bool ok = true;
     const unsigned char *api_bytes = (const unsigned char *)api_response.data;
     for (uint32_t i = 0; ok && i < api_row_count; i++) {
-        size_t api_row_offset = OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE + (size_t)i * FILE_OPENERS_BINARY_ROW_SIZE;
-        for (size_t field_offset = 0; ok && field_offset < FILE_OPENERS_BINARY_ROW_SIZE; field_offset += 8) {
+        size_t api_row_offset = OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE + (size_t)i * FILE_OPENERS_API_ROW_SIZE;
+        const unsigned char *socket_path = NULL;
+        size_t socket_path_length = 0;
+        for (size_t field_offset = 0; ok && field_offset < FILE_OPENERS_API_ROW_SIZE; field_offset += 8) {
             const unsigned char *value = NULL;
             size_t value_length = 0;
             ok = read_binary_string_ref_view(api_bytes, api_response.length, api_row_offset + field_offset, &value, &value_length) &&
                  append_binary_data_ref(&rows, &variable, value, value_length);
+            if (ok && field_offset == 24) {
+                socket_path = value;
+                socket_path_length = value_length;
+            }
+        }
+        if (ok) {
+            char socket_path_buffer[PATH_MAX];
+            size_t length = socket_path_length < sizeof(socket_path_buffer) - 1 ? socket_path_length : sizeof(socket_path_buffer) - 1;
+            if (socket_path && length > 0) {
+                memcpy(socket_path_buffer, socket_path, length);
+            }
+            socket_path_buffer[length] = '\0';
+            char owner_name[128];
+            opener_owner_name_for_socket_path(socket_path_buffer, owner_name, sizeof(owner_name));
+            ok = append_binary_data_ref(&rows,
+                                        &variable,
+                                        (const unsigned char *)owner_name,
+                                        strlen(owner_name));
         }
         if (ok) row_count++;
     }
@@ -650,13 +691,15 @@ static void send_openers_response_for_path(int fd, const char *requested) {
     free(response.data);
 }
 
-static void send_openers_response(int fd, const char *query) {
+static void send_openers_response(int fd,
+                                  const char *query,
+                                  const char *requester_user) {
     char requested[PATH_MAX];
     if (!query_value(query, "path", requested, sizeof(requested))) {
         send_text_response(fd, 400, "missing path\n");
         return;
     }
-    send_openers_response_for_path(fd, requested);
+    send_openers_response_for_path(fd, requested, requester_user);
 }
 
 static int hex_value(char c) {
@@ -1125,6 +1168,35 @@ static size_t request_content_length(const char *request) {
     return 0;
 }
 
+static bool request_header_value(const char *request, const char *name, char *dst, size_t dst_size) {
+    if (!request || !name || !name[0] || !dst || dst_size == 0) return false;
+    dst[0] = '\0';
+    size_t name_len = strlen(name);
+    const char *headers_end = strstr(request, "\r\n\r\n");
+    if (!headers_end) return false;
+    const char *line = strstr(request, "\r\n");
+    if (!line || line >= headers_end) return false;
+    line += 2;
+    while (line < headers_end && *line) {
+        const char *line_end = strstr(line, "\r\n");
+        if (!line_end || line_end > headers_end) line_end = headers_end;
+        const char *colon = memchr(line, ':', (size_t)(line_end - line));
+        if (colon && (size_t)(colon - line) == name_len && strncasecmp(line, name, name_len) == 0) {
+            const char *value = colon + 1;
+            while (value < line_end && (*value == ' ' || *value == '\t')) value++;
+            const char *trimmed_end = line_end;
+            while (trimmed_end > value && (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t')) trimmed_end--;
+            size_t len = (size_t)(trimmed_end - value);
+            if (len >= dst_size) len = dst_size - 1;
+            memcpy(dst, value, len);
+            dst[len] = '\0';
+            return true;
+        }
+        line = line_end + 2;
+    }
+    return false;
+}
+
 static unsigned char *read_request_body(int fd,
                                         const char *request,
                                         ssize_t request_len,
@@ -1205,6 +1277,9 @@ static void handle_client(int fd) {
         query++;
     }
 
+    char requester_user[256];
+    request_header_value(request, "X-Outer-Loop-User", requester_user, sizeof(requester_user));
+
     if (strcasecmp(method, "POST") == 0) {
         size_t content_length = request_content_length(request);
         unsigned char *body = read_request_body(fd, request, n, content_length);
@@ -1230,7 +1305,7 @@ static void handle_client(int fd) {
                 send_text_response(fd, 400, "bad openers request\n");
                 return;
             }
-            send_openers_response_for_path(fd, requested);
+            send_openers_response_for_path(fd, requested, requester_user);
             free(body);
             return;
         }
@@ -1267,7 +1342,7 @@ static void handle_client(int fd) {
     } else if (strcmp(target, "/api/files") == 0) {
         send_files_response(fd, query);
     } else if (strcmp(target, "/api/openers") == 0) {
-        send_openers_response(fd, query);
+        send_openers_response(fd, query, requester_user);
     } else if (strcmp(target, "/api/download") == 0) {
         send_download_response(fd, query);
     } else {

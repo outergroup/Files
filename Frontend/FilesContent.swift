@@ -38,14 +38,15 @@ private struct FileOpener: Sendable {
     let displayName: String
     let socketPath: String
     let url: String
+    let ownerName: String
 }
 
 private enum FileOpenersBinaryFormat {
     static let magic: UInt32 = 0x504f464f
     static let requestMagic: UInt32 = 0x514f464f
-    static let version: UInt32 = 1
+    static let version: UInt32 = 2
     static let headerSize = 32
-    static let rowSize = 40
+    static let rowSize = 48
 }
 
 private enum FilePathRequestBinaryFormat {
@@ -1354,8 +1355,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     self.pendingOpenMenuEntries[menuID] = (entry, openers)
                     items.append(self.contextMenuSeparator(id: "openers-separator"))
                     items.append(self.contextMenuLabel(id: "openers-heading", title: "Open With"))
+                    let duplicateOpenerTitles = self.duplicateOpenerBaseTitles(openers)
                     for (index, opener) in openers.enumerated() {
-                        let title = opener.displayName.isEmpty ? opener.serviceID : opener.displayName
+                        let title = self.contextMenuTitle(for: opener,
+                                                          duplicateBaseTitles: duplicateOpenerTitles)
                         items.append(OuterframeContextMenuItem(id: "open-\(index)",
                                                                title: title,
                                                                isEnabled: true,
@@ -1379,6 +1382,34 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                                   systemImageName: "clipboard")
                                        ],
                                        at: point)
+    }
+
+    private func openerBaseTitle(_ opener: FileOpener) -> String {
+        let displayName = opener.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !displayName.isEmpty {
+            return displayName
+        }
+        return opener.serviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func duplicateOpenerBaseTitles(_ openers: [FileOpener]) -> Set<String> {
+        var counts: [String: Int] = [:]
+        for opener in openers {
+            counts[openerBaseTitle(opener), default: 0] += 1
+        }
+        return Set(counts.compactMap { title, count in count > 1 ? title : nil })
+    }
+
+    private func contextMenuTitle(for opener: FileOpener, duplicateBaseTitles: Set<String>) -> String {
+        let baseTitle = openerBaseTitle(opener)
+        let ownerName = opener.ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let qualifiedTitle: String
+        if duplicateBaseTitles.contains(baseTitle), !ownerName.isEmpty {
+            qualifiedTitle = "\(ownerName) / \(baseTitle)"
+        } else {
+            qualifiedTitle = baseTitle
+        }
+        return "Open in \"\(qualifiedTitle)\""
     }
 
     private func handleContextMenuItemSelected(menuID: UUID, itemID: String) {
@@ -1564,14 +1595,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                   let serviceID = row.readStringReference(),
                   let displayName = row.readStringReference(),
                   let socketPath = row.readStringReference(),
-                  let url = row.readStringReference() else {
+                  let url = row.readStringReference(),
+                  let ownerName = row.readStringReference() else {
                 return nil
             }
             openers.append(FileOpener(contentType: contentType,
                                       serviceID: serviceID,
                                       displayName: displayName,
                                       socketPath: socketPath,
-                                      url: url))
+                                      url: url,
+                                      ownerName: ownerName))
         }
         return openers
     }
