@@ -269,6 +269,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private let modifiedHeaderLayer = CATextLayer()
     private let sizeHeaderLayer = CATextLayer()
     private let rowsClipLayer = CALayer()
+    private let rowsContentLayer = CALayer()
     private let statusLayer = CATextLayer()
 
     private var appearance = NSAppearance.currentDrawing()
@@ -296,9 +297,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var shouldReplaceHistoryEntryAfterLoad = false
     private var favoriteFrames: [(frame: CGRect, path: String)] = []
     private var breadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
+    private lazy var rowsScrollbarDelegate = FilesRowsScrollbarDelegate(owner: self)
+    private var rowsScrollbarController: ScrollbarController<FilesRowsScrollbarDelegate>?
+    private var visibleRowLayers: [Int: CALayer] = [:]
+    private var reusableRowLayers: [CALayer] = []
     private var pendingDirectoryMenuEntries: [UUID: FileEntry] = [:]
     private var pendingOpenMenuEntries: [UUID: (entry: FileEntry, openers: [FileOpener])] = [:]
     private var accessibilityNotificationScheduled = false
+    private var typeaheadPrefix = ""
+    private var typeaheadLastUpdated: Date?
 
     private let favoritesBarHeight: CGFloat = 36
     private let breadcrumbBarHeight: CGFloat = 34
@@ -356,9 +363,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
             guard rowsClipLayer.frame.contains(rootLayer.convert(point, to: rowsClipLayer.superlayer)) else { return }
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
-            scrollOffset -= delta.y * multiplier
-            clampScrollOffset()
-            updateRows()
+            setRowsScroll(scrollOffset - delta.y * multiplier)
 
         case .mouseDown(let point, _, let clickCount):
             handleMouseDown(at: point, clickCount: clickCount)
@@ -372,8 +377,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         case .rightMouseDown(let point, _, _):
             handleRightMouseDown(at: point)
 
-        case .keyDown(let keyCode, _, _, _, _):
-            handleKeyDown(keyCode: keyCode)
+        case .keyDown(let keyCode, let characters, _, _, _):
+            handleKeyDown(keyCode: keyCode, characters: characters)
 
         case .selectionToPasteboardCopyRequest(let requestID):
             handleSelectionToPasteboardCopyRequest(requestID: requestID)
@@ -442,6 +447,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         rootLayer.addSublayer(headerLayer)
         rootLayer.addSublayer(rowsClipLayer)
         rootLayer.addSublayer(statusLayer)
+        rowsClipLayer.masksToBounds = true
+        rowsClipLayer.addSublayer(rowsContentLayer)
+        let scrollbar = ScrollbarController<FilesRowsScrollbarDelegate>(appConnection: outerframeHost,
+                                                                        viewportLayer: rowsClipLayer,
+                                                                        appearance: appearance,
+                                                                        width: 8,
+                                                                        inset: 4,
+                                                                        scrollOffsetOrigin: .bottom)
+        scrollbar.delegate = rowsScrollbarDelegate
+        rowsScrollbarController = scrollbar
 
         headerLayer.addSublayer(nameHeaderLayer)
         headerLayer.addSublayer(modifiedHeaderLayer)
@@ -487,9 +502,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
             rowsClipLayer.frame = CGRect(x: 0, y: 0, width: width, height: headerY)
             statusLayer.frame = CGRect(x: horizontalInset, y: max(headerY - 30, 0), width: contentWidth, height: 18)
+            clampScrollOffset()
             updateFavoritesBar()
             updateBreadcrumbBar()
-            updateRows()
+            updateRows(rebuild: true)
         }
         notifyAccessibilityLayoutChanged()
     }
@@ -505,9 +521,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 modifiedHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 sizeHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                rowsScrollbarController?.updateAppearance(appearance)
                 updateFavoritesBar()
                 updateBreadcrumbBar()
-                updateRows()
+                updateRows(rebuild: true)
             }
         }
     }
@@ -717,6 +734,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     self.parentPath = response.parent
                     self.entries = response.entries
                     self.selectedIndex = nil
+                    self.resetTypeahead()
                     self.dragCandidateIndex = nil
                     self.dragStartPoint = nil
                     self.dragStartedForSelectionIndex = nil
@@ -742,15 +760,63 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }.resume()
     }
 
-    private func updateRows() {
+    private func updateRows(rebuild: Bool = true) {
+        updateVisibleRows(rebuild: rebuild, notifyAccessibility: true)
+    }
+
+    fileprivate func setRowsScroll(_ value: CGFloat) {
+        let maxOffset = max(CGFloat(entries.count) * rowHeight - rowsClipLayer.bounds.height, 0)
+        let clamped = min(max(value, 0), maxOffset)
+        guard abs(clamped - scrollOffset) > 0.001 else {
+            updateRowsScrollbarLayout()
+            return
+        }
+        scrollOffset = clamped
+        updateVisibleRows(rebuild: false, notifyAccessibility: false)
+    }
+
+    private func updateVisibleRows(rebuild: Bool, notifyAccessibility: Bool) {
         withoutImplicitAnimations {
-            rowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-            if !entries.isEmpty {
-                appearance.performAsCurrentDrawingAppearance {
+            if rowsContentLayer.superlayer !== rowsClipLayer {
+                rowsClipLayer.addSublayer(rowsContentLayer)
+            }
+            if rebuild {
+                recycleAllRowLayers()
+            }
+
+            let viewportHeight = max(rowsClipLayer.bounds.height, 0)
+            let viewportWidth = max(rowsClipLayer.bounds.width, 1)
+            let contentHeight = CGFloat(entries.count) * rowHeight
+            scrollOffset = min(max(scrollOffset, 0), max(contentHeight - viewportHeight, 0))
+            rowsContentLayer.frame = CGRect(x: 0,
+                                            y: viewportHeight - contentHeight + scrollOffset,
+                                            width: viewportWidth,
+                                            height: max(contentHeight, 0))
+
+            guard !entries.isEmpty, viewportHeight > 0 else {
+                recycleAllRowLayers()
+                rowsContentLayer.frame = CGRect(origin: .zero, size: CGSize(width: viewportWidth, height: 0))
+                updateRowsScrollbarLayout()
+                if notifyAccessibility {
+                    notifyAccessibilityLayoutChanged()
+                }
+                return
+            }
+
+            appearance.performAsCurrentDrawingAppearance {
                 let visibleStart = max(Int(floor(scrollOffset / rowHeight)), 0)
-                let visibleCount = Int(ceil(rowsClipLayer.bounds.height / rowHeight)) + 2
-                let visibleEnd = min(entries.count, visibleStart + visibleCount)
-                let contentWidth = max(rowsClipLayer.bounds.width - horizontalInset * 2, 1)
+                let visibleEnd = min(entries.count, visibleStart + Int(ceil(viewportHeight / rowHeight)) + 2)
+                let visibleRange = visibleStart..<visibleEnd
+
+                let staleIndices = visibleRowLayers.keys.filter { !visibleRange.contains($0) }
+                for index in staleIndices {
+                    if let layer = visibleRowLayers[index] {
+                        recycleRowLayer(layer)
+                    }
+                    visibleRowLayers.removeValue(forKey: index)
+                }
+
+                let contentWidth = max(viewportWidth - horizontalInset * 2, 1)
                 let nameWidth = floor(contentWidth * nameColumnWidth)
                 let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
                 let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
@@ -760,52 +826,140 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 let bodyTextColor = NSColor.labelColor.cgColor
                 let secondaryTextColor = NSColor.secondaryLabelColor.cgColor
 
-                for index in visibleStart..<visibleEnd {
+                for index in visibleRange {
                     let entry = entries[index]
                     let isSelected = selectedIndex == index
-                    let top = rowsClipLayer.bounds.height - CGFloat(index) * rowHeight + scrollOffset - rowHeight
-                    let rowLayer = CALayer()
-                    rowLayer.frame = CGRect(x: 0, y: top, width: rowsClipLayer.bounds.width, height: rowHeight)
-
-                    if isSelected {
-                        rowLayer.backgroundColor = selectedBackgroundColor
-                    } else if index.isMultiple(of: 2) {
-                        rowLayer.backgroundColor = rowColors.even
+                    let top = contentHeight - CGFloat(index + 1) * rowHeight
+                    let frame = CGRect(x: 0, y: top, width: viewportWidth, height: rowHeight)
+                    let rowLayer: CALayer
+                    let needsConfigure: Bool
+                    if let existing = visibleRowLayers[index] {
+                        rowLayer = existing
+                        needsConfigure = rebuild || existing.frame.size != frame.size || existing.frame.origin != frame.origin
+                    } else if let reusable = reusableRowLayers.popLast() {
+                        rowLayer = reusable
+                        rowsContentLayer.addSublayer(rowLayer)
+                        visibleRowLayers[index] = rowLayer
+                        needsConfigure = true
                     } else {
-                        rowLayer.backgroundColor = rowColors.odd
+                        rowLayer = makeRowLayer()
+                        rowsContentLayer.addSublayer(rowLayer)
+                        visibleRowLayers[index] = rowLayer
+                        needsConfigure = true
                     }
-
-                    let iconLayer = CALayer()
-                    iconLayer.frame = CGRect(x: horizontalInset, y: 5, width: 16, height: 16)
-                    iconLayer.contentsGravity = .resizeAspect
-                    iconLayer.contentsScale = 2
-                    iconLayer.contents = rowIconCGImage(for: entry, size: CGSize(width: 16, height: 16))
-
-                    let nameLayer = makeTextLayer(size: 13, weight: .regular)
-                    nameLayer.string = entry.name
-                    nameLayer.foregroundColor = isSelected ? selectedTextColor : bodyTextColor
-                    nameLayer.frame = CGRect(x: horizontalInset + 24, y: 5, width: max(nameWidth - 24, 1), height: 17)
-
-                    let modifiedLayer = makeTextLayer(size: 12, weight: .regular)
-                    modifiedLayer.string = formatModified(entry.modified)
-                    modifiedLayer.foregroundColor = isSelected ? selectedTextColor : secondaryTextColor
-                    modifiedLayer.frame = CGRect(x: horizontalInset + nameWidth, y: 5, width: modifiedWidth, height: 17)
-
-                    let sizeLayer = makeTextLayer(size: 12, weight: .regular, alignment: .right)
-                    sizeLayer.string = entry.isDirectory ? "--" : formatByteCount(entry.size)
-                    sizeLayer.foregroundColor = isSelected ? selectedTextColor : secondaryTextColor
-                    sizeLayer.frame = CGRect(x: horizontalInset + nameWidth + modifiedWidth, y: 5, width: sizeWidth, height: 17)
-
-                    rowLayer.addSublayer(iconLayer)
-                    rowLayer.addSublayer(nameLayer)
-                    rowLayer.addSublayer(modifiedLayer)
-                    rowLayer.addSublayer(sizeLayer)
-                    rowsClipLayer.addSublayer(rowLayer)
+                    if needsConfigure {
+                        configureRowLayer(rowLayer,
+                                          entry: entry,
+                                          index: index,
+                                          frame: frame,
+                                          isSelected: isSelected,
+                                          rowColors: rowColors,
+                                          selectedBackgroundColor: selectedBackgroundColor,
+                                          selectedTextColor: selectedTextColor,
+                                          bodyTextColor: bodyTextColor,
+                                          secondaryTextColor: secondaryTextColor,
+                                          nameWidth: nameWidth,
+                                          modifiedWidth: modifiedWidth,
+                                          sizeWidth: sizeWidth)
+                    }
                 }
             }
-            }
         }
-        notifyAccessibilityLayoutChanged()
+        updateRowsScrollbarLayout()
+        if notifyAccessibility {
+            notifyAccessibilityLayoutChanged()
+        }
+    }
+
+    private func makeRowLayer() -> CALayer {
+        let rowLayer = CALayer()
+
+        let iconLayer = CALayer()
+        iconLayer.contentsGravity = .resizeAspect
+        iconLayer.contentsScale = 2
+        rowLayer.addSublayer(iconLayer)
+
+        rowLayer.addSublayer(makeTextLayer(size: 13, weight: .regular))
+        rowLayer.addSublayer(makeTextLayer(size: 12, weight: .regular))
+        rowLayer.addSublayer(makeTextLayer(size: 12, weight: .regular, alignment: .right))
+        return rowLayer
+    }
+
+    private func configureRowLayer(_ rowLayer: CALayer,
+                                   entry: FileEntry,
+                                   index: Int,
+                                   frame: CGRect,
+                                   isSelected: Bool,
+                                   rowColors: (even: CGColor, odd: CGColor),
+                                   selectedBackgroundColor: CGColor,
+                                   selectedTextColor: CGColor,
+                                   bodyTextColor: CGColor,
+                                   secondaryTextColor: CGColor,
+                                   nameWidth: CGFloat,
+                                   modifiedWidth: CGFloat,
+                                   sizeWidth: CGFloat) {
+        rowLayer.frame = frame
+        if isSelected {
+            rowLayer.backgroundColor = selectedBackgroundColor
+        } else if index.isMultiple(of: 2) {
+            rowLayer.backgroundColor = rowColors.even
+        } else {
+            rowLayer.backgroundColor = rowColors.odd
+        }
+
+        if rowLayer.sublayers?.count != 4 {
+            rowLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            let iconLayer = CALayer()
+            iconLayer.contentsGravity = .resizeAspect
+            iconLayer.contentsScale = 2
+            rowLayer.addSublayer(iconLayer)
+            rowLayer.addSublayer(makeTextLayer(size: 13, weight: .regular))
+            rowLayer.addSublayer(makeTextLayer(size: 12, weight: .regular))
+            rowLayer.addSublayer(makeTextLayer(size: 12, weight: .regular, alignment: .right))
+        }
+
+        let iconLayer = rowLayer.sublayers?[0]
+        iconLayer?.frame = CGRect(x: horizontalInset, y: 5, width: 16, height: 16)
+        iconLayer?.contents = rowIconCGImage(for: entry, size: CGSize(width: 16, height: 16))
+
+        if let nameLayer = rowLayer.sublayers?[1] as? CATextLayer {
+            nameLayer.string = entry.name
+            nameLayer.foregroundColor = isSelected ? selectedTextColor : bodyTextColor
+            nameLayer.frame = CGRect(x: horizontalInset + 24, y: 5, width: max(nameWidth - 24, 1), height: 17)
+        }
+
+        if let modifiedLayer = rowLayer.sublayers?[2] as? CATextLayer {
+            modifiedLayer.string = formatModified(entry.modified)
+            modifiedLayer.foregroundColor = isSelected ? selectedTextColor : secondaryTextColor
+            modifiedLayer.frame = CGRect(x: horizontalInset + nameWidth, y: 5, width: modifiedWidth, height: 17)
+        }
+
+        if let sizeLayer = rowLayer.sublayers?[3] as? CATextLayer {
+            sizeLayer.string = entry.isDirectory ? "--" : formatByteCount(entry.size)
+            sizeLayer.foregroundColor = isSelected ? selectedTextColor : secondaryTextColor
+            sizeLayer.frame = CGRect(x: horizontalInset + nameWidth + modifiedWidth, y: 5, width: sizeWidth, height: 17)
+        }
+    }
+
+    private func recycleRowLayer(_ layer: CALayer) {
+        layer.removeFromSuperlayer()
+        reusableRowLayers.append(layer)
+    }
+
+    private func recycleAllRowLayers() {
+        rowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        visibleRowLayers.removeAll()
+        reusableRowLayers.removeAll()
+    }
+
+    private func rowsScrollbarMetrics() -> ScrollbarController<FilesRowsScrollbarDelegate>.Metrics {
+        ScrollbarController.Metrics(viewportSize: rowsClipLayer.bounds.size,
+                                    contentHeight: CGFloat(entries.count) * rowHeight,
+                                    scrollOffset: scrollOffset)
+    }
+
+    private func updateRowsScrollbarLayout() {
+        rowsScrollbarController?.updateLayout(metrics: rowsScrollbarMetrics())
     }
 
     private func handleMouseDown(at point: CGPoint, clickCount: Int) {
@@ -816,6 +970,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         if let favoritePath = favoritePath(at: point) {
             selectedIndex = nil
+            resetTypeahead()
             updateRows()
             updatePasteboardCapabilities()
             updateFavoritesBar()
@@ -825,6 +980,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         if let breadcrumbPath = breadcrumbPath(at: point) {
             selectedIndex = nil
+            resetTypeahead()
             updateRows()
             updatePasteboardCapabilities()
             updateFavoritesBar()
@@ -832,9 +988,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
+        if rowsClipLayer.bounds.contains(rowsClipLayer.convert(point, from: rootLayer)),
+           rowsScrollbarController?.handleMouseDown(at: rootLayer.convert(point, to: rowsClipLayer)) == true {
+            return
+        }
+
         let index = rowIndex(at: point)
         guard index >= 0, index < entries.count else {
             selectedIndex = nil
+            resetTypeahead()
             updateRows()
             updatePasteboardCapabilities()
             updateFavoritesBar()
@@ -842,6 +1004,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         selectedIndex = index
+        resetTypeahead()
         dragCandidateIndex = index
         dragStartPoint = point
         updateRows()
@@ -861,6 +1024,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags _: NSEvent.ModifierFlags) {
+        if rowsScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: rowsClipLayer)) == true {
+            return
+        }
+
         guard let selectedIndex,
               dragCandidateIndex == selectedIndex,
               dragStartedForSelectionIndex != selectedIndex,
@@ -893,6 +1060,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseUp(at point: CGPoint) {
+        _ = rowsScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: rowsClipLayer))
         defer {
             dragCandidateIndex = nil
             dragStartPoint = nil
@@ -914,15 +1082,17 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         addFavorite(entry)
     }
 
-    private func handleKeyDown(keyCode: UInt16) {
+    private func handleKeyDown(keyCode: UInt16, characters: String?) {
         switch keyCode {
         case 126:
             dragCandidateIndex = nil
             dragStartPoint = nil
+            resetTypeahead()
             moveSelection(delta: -1)
         case 125:
             dragCandidateIndex = nil
             dragStartPoint = nil
+            resetTypeahead()
             moveSelection(delta: 1)
         case 36, 76:
             if let selectedIndex, entries[selectedIndex].isDirectory {
@@ -933,6 +1103,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 openDirectory(path: parentPath)
             }
         default:
+            if let characters,
+               let text = typeaheadText(from: characters) {
+                handleTypeahead(text)
+            }
             break
         }
     }
@@ -951,6 +1125,71 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         clampScrollOffset()
         updateRows()
         updatePasteboardCapabilities()
+    }
+
+    private func selectIndex(_ index: Int) {
+        guard entries.indices.contains(index) else { return }
+        selectedIndex = index
+        ensureSelectionVisible()
+        updateRows()
+        updatePasteboardCapabilities()
+    }
+
+    private func ensureSelectionVisible() {
+        guard let selectedIndex else { return }
+        let rowTop = CGFloat(selectedIndex) * rowHeight
+        let viewportHeight = rowsClipLayer.bounds.height
+        if rowTop < scrollOffset {
+            scrollOffset = rowTop
+        } else if rowTop + rowHeight > scrollOffset + viewportHeight {
+            scrollOffset = rowTop + rowHeight - viewportHeight
+        }
+        clampScrollOffset()
+    }
+
+    private func resetTypeahead() {
+        typeaheadPrefix = ""
+        typeaheadLastUpdated = nil
+    }
+
+    private func handleTypeahead(_ text: String) {
+        guard !entries.isEmpty else { return }
+        let now = Date()
+        if let last = typeaheadLastUpdated,
+           now.timeIntervalSince(last) > 1.0 {
+            typeaheadPrefix = ""
+        }
+        typeaheadLastUpdated = now
+        typeaheadPrefix += text.lowercased()
+        if selectEntry(matchingPrefix: typeaheadPrefix) {
+            return
+        }
+        typeaheadPrefix = text.lowercased()
+        _ = selectEntry(matchingPrefix: typeaheadPrefix)
+    }
+
+    private func selectEntry(matchingPrefix prefix: String) -> Bool {
+        guard !prefix.isEmpty else { return false }
+        let start = (selectedIndex ?? -1) + 1
+        for offset in 0..<entries.count {
+            let index = (start + offset) % entries.count
+            if entries[index].name.lowercased().hasPrefix(prefix) {
+                selectIndex(index)
+                return true
+            }
+        }
+        return false
+    }
+
+    private func typeaheadText(from characters: String) -> String? {
+        guard !characters.isEmpty,
+              characters.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0) &&
+                  !CharacterSet.newlines.contains($0)
+              }) else {
+            return nil
+        }
+        return characters
     }
 
     private func clampScrollOffset() {
@@ -2149,4 +2388,17 @@ private func withoutImplicitAnimations(_ body: () -> Void) {
     CATransaction.setDisableActions(true)
     body()
     CATransaction.commit()
+}
+
+@MainActor
+private final class FilesRowsScrollbarDelegate: ScrollbarControllerDelegate {
+    private weak var owner: FilesHandler?
+
+    init(owner: FilesHandler) {
+        self.owner = owner
+    }
+
+    func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        owner?.setRowsScroll(offset)
+    }
 }
