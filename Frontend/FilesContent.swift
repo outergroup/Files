@@ -60,6 +60,11 @@ private struct FileOpenMenuAction {
     let opener: FileOpener
 }
 
+private enum FileOpenersFetchResult {
+    case success([FileOpener])
+    case failure(String)
+}
+
 private enum FileOpenersBinaryFormat {
     static let magic: UInt32 = 0x504f464f
     static let requestMagic: UInt32 = 0x514f464f
@@ -1348,19 +1353,28 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             updateRows()
             updatePasteboardCapabilities()
             let entry = entries[index]
-            fetchOpeners(for: entry) { [weak self] openers in
+            fetchOpeners(for: entry) { [weak self] result in
                 guard let self else { return }
                 let menuID = UUID()
                 var items: [OuterframeContextMenuItem] = []
-                let openerActions = self.openMenuActions(for: entry, openers: openers)
-                if !openerActions.isEmpty {
-                    self.pendingOpenMenuEntries[menuID] = (entry, openerActions.map(\.opener))
-                    for (index, action) in openerActions.enumerated() {
-                        items.append(OuterframeContextMenuItem(id: "open-\(index)",
-                                                               title: action.title,
-                                                               isEnabled: true,
-                                                               systemImageName: "arrow.up.forward"))
+                switch result {
+                case .success(let openers):
+                    let openerActions = self.openMenuActions(for: entry, openers: openers)
+                    if !openerActions.isEmpty {
+                        self.pendingOpenMenuEntries[menuID] = (entry, openerActions.map(\.opener))
+                        for (index, action) in openerActions.enumerated() {
+                            items.append(OuterframeContextMenuItem(id: "open-\(index)",
+                                                                   title: action.title,
+                                                                   isEnabled: true,
+                                                                   systemImageName: "arrow.up.forward"))
+                        }
+                        items.append(self.contextMenuSeparator(id: "copy-separator"))
                     }
+                case .failure(let message):
+                    items.append(OuterframeContextMenuItem(id: "openers-error",
+                                                           title: "Could not load openers: \(message)",
+                                                           isEnabled: false,
+                                                           systemImageName: "exclamationmark.triangle"))
                     items.append(self.contextMenuSeparator(id: "copy-separator"))
                 }
                 items.append(OuterframeContextMenuItem(id: "copy",
@@ -1494,8 +1508,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func openFileWithDefaultOpener(_ entry: FileEntry) {
         guard !entry.isDirectory else { return }
         statusLayer.string = ""
-        fetchOpeners(for: entry) { [weak self] openers in
+        fetchOpeners(for: entry) { [weak self] result in
             guard let self else { return }
+            let openers: [FileOpener]
+            switch result {
+            case .success(let fetchedOpeners):
+                openers = fetchedOpeners
+            case .failure(let message):
+                self.statusLayer.string = "Could not load openers: \(message)"
+                return
+            }
             guard let opener = self.openMenuActions(for: entry, openers: openers).first?.opener else {
                 self.statusLayer.string = "No app found for \(entry.name)"
                 return
@@ -1514,25 +1536,45 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         outerframeHost.navigate(to: url)
     }
 
-    private func fetchOpeners(for entry: FileEntry, completion: @escaping @MainActor ([FileOpener]) -> Void) {
+    private func fetchOpeners(for entry: FileEntry, completion: @escaping @MainActor (FileOpenersFetchResult) -> Void) {
         guard !entry.isDirectory,
               let openersEndpoint,
               let urlSession else {
-            completion([])
+            completion(.success([]))
             return
         }
         guard let request = Self.binaryPathRequest(url: openersEndpoint,
                                                    magic: FileOpenersBinaryFormat.requestMagic,
                                                    path: entry.path) else {
-            completion([])
+            completion(.failure("could not build request"))
             return
         }
-        urlSession.dataTask(with: request) { data, _, _ in
-            let openers = data.flatMap(Self.decodeFileOpeners) ?? []
+        urlSession.dataTask(with: request) { data, response, error in
+            let result: FileOpenersFetchResult
+            if let error {
+                result = .failure(error.localizedDescription)
+            } else if let httpResponse = response as? HTTPURLResponse,
+                      !(200..<300).contains(httpResponse.statusCode) {
+                result = .failure(Self.responseErrorMessage(data: data, fallback: "HTTP \(httpResponse.statusCode)"))
+            } else if let data,
+                      let openers = Self.decodeFileOpeners(data) {
+                result = .success(openers)
+            } else {
+                result = .failure("invalid response")
+            }
             Task { @MainActor in
-                completion(openers)
+                completion(result)
             }
         }.resume()
+    }
+
+    nonisolated private static func responseErrorMessage(data: Data?, fallback: String) -> String {
+        guard let data,
+              let rawMessage = String(data: data, encoding: .utf8) else {
+            return fallback
+        }
+        let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? fallback : message
     }
 
     nonisolated private static func binaryPathRequest(url: URL, magic: UInt32, path: String) -> URLRequest? {

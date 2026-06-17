@@ -76,6 +76,17 @@ typedef struct {
     int group_count;
 } RequesterAccessContext;
 
+typedef struct {
+    int fd;
+    char request[READ_BUFFER_SIZE];
+    size_t request_len;
+    size_t header_len;
+    size_t content_length;
+    unsigned char *body;
+    size_t body_len;
+    time_t accepted_at;
+} HttpClient;
+
 static bool query_value(const char *query, const char *name, char *dst, size_t dst_size);
 static void resolve_requested_path(const char *requested, char *resolved, size_t resolved_size);
 
@@ -144,6 +155,7 @@ static void send_text_response(int fd, int status, const char *message) {
     const char *status_text = status == 200 ? "OK" :
                               status == 400 ? "Bad Request" :
                               status == 404 ? "Not Found" :
+                              status == 502 ? "Bad Gateway" :
                               status == 500 ? "Internal Server Error" : "Error";
     send_response(fd, status, status_text, "text/plain; charset=utf-8", message, strlen(message));
 }
@@ -579,16 +591,13 @@ static bool query_file_openers_from_outershelld(const char *path,
     return ok;
 }
 
-static void send_empty_openers_response(int fd) {
-    char header[FILE_OPENERS_BINARY_HEADER_SIZE];
-    memset(header, 0, sizeof(header));
-    write_u32_le_at(header, 0, FILE_OPENERS_BINARY_MAGIC);
-    write_u32_le_at(header, 4, FILE_OPENERS_BINARY_VERSION);
-    write_u32_le_at(header, 12, FILE_OPENERS_BINARY_ROW_SIZE);
-    write_u32_le_at(header, 16, FILE_OPENERS_BINARY_HEADER_SIZE);
-    write_u32_le_at(header, 20, FILE_OPENERS_BINARY_HEADER_SIZE);
-    write_u32_le_at(header, 24, FILE_OPENERS_BINARY_HEADER_SIZE);
-    send_response(fd, 200, "OK", "application/octet-stream", header, sizeof(header));
+static void send_openers_error_response(int fd, int status, const char *message) {
+    const char *safe_message = message ? message : "openers unavailable\n";
+    fprintf(stderr, "FilesBackend openers: %s", safe_message);
+    if (safe_message[0] && safe_message[strlen(safe_message) - 1] != '\n') {
+        fprintf(stderr, "\n");
+    }
+    send_text_response(fd, status, safe_message);
 }
 
 static void opener_owner_name_for_socket_path(const char *socket_path, char *out, size_t out_size) {
@@ -613,24 +622,36 @@ static void send_openers_response_for_path(int fd,
     char path[PATH_MAX];
     resolve_requested_path(requested, path, sizeof(path));
     if (!g_outershelld_api_socket_path[0]) {
-        send_empty_openers_response(fd);
+        send_openers_error_response(fd, 502, "openers unavailable: outershelld API socket is not configured\n");
         return;
     }
 
     StringBuilder api_response = {0};
-    if (!query_file_openers_from_outershelld(path, "", requester_user, &api_response) ||
-        api_response.length < OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE ||
-        read_u16_le_from_bytes((const unsigned char *)api_response.data, 0) != OUTERSHELLD_API_FILE_OPENERS_RESPONSE ||
-        read_u32_le_from_bytes((const unsigned char *)api_response.data, 2) != 0) {
+    if (!query_file_openers_from_outershelld(path, "", requester_user, &api_response)) {
         free(api_response.data);
-        send_empty_openers_response(fd);
+        send_openers_error_response(fd, 502, "openers unavailable: failed to query outershelld API\n");
+        return;
+    }
+    if (api_response.length < OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE ||
+        read_u16_le_from_bytes((const unsigned char *)api_response.data, 0) != OUTERSHELLD_API_FILE_OPENERS_RESPONSE) {
+        free(api_response.data);
+        send_openers_error_response(fd, 502, "openers unavailable: outershelld returned an invalid opener response\n");
+        return;
+    }
+    if (read_u32_le_from_bytes((const unsigned char *)api_response.data, 2) != 0) {
+        char api_error[512] = "outershelld returned an opener query error";
+        (void)read_binary_string_ref((const unsigned char *)api_response.data, api_response.length, 6, api_error, sizeof(api_error));
+        char message[640];
+        snprintf(message, sizeof(message), "openers unavailable: %s\n", api_error[0] ? api_error : "outershelld returned an opener query error");
+        free(api_response.data);
+        send_openers_error_response(fd, 502, message);
         return;
     }
 
     uint32_t api_row_count = read_u32_le_from_bytes((const unsigned char *)api_response.data, 14);
     if (api_row_count > (api_response.length - OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE) / FILE_OPENERS_API_ROW_SIZE) {
         free(api_response.data);
-        send_empty_openers_response(fd);
+        send_openers_error_response(fd, 502, "openers unavailable: outershelld opener response is truncated\n");
         return;
     }
 
@@ -1334,76 +1355,35 @@ static bool request_header_value(const char *request, const char *name, char *ds
     return false;
 }
 
-static unsigned char *read_request_body(int fd,
-                                        const char *request,
-                                        ssize_t request_len,
-                                        size_t content_length) {
-    char *headers_end = strstr((char *)request, "\r\n\r\n");
-    if (!headers_end) {
-        return NULL;
-    }
-
-    const char *initial_body = headers_end + 4;
-    size_t header_len = (size_t)(initial_body - request);
-    size_t initial_body_len = request_len > (ssize_t)header_len ? (size_t)request_len - header_len : 0;
-    if (initial_body_len > content_length) {
-        initial_body_len = content_length;
-    }
-
-    unsigned char *body = malloc(content_length ? content_length : 1);
-    if (!body) {
-        return NULL;
-    }
-    memcpy(body, initial_body, initial_body_len);
-
-    size_t offset = initial_body_len;
-    while (offset < content_length) {
-        ssize_t got = read(fd, body + offset, content_length - offset);
-        if (got < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            free(body);
-            return NULL;
-        }
-        if (got == 0) {
-            free(body);
-            return NULL;
-        }
-        offset += (size_t)got;
-    }
-    return body;
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void handle_client(int fd) {
+static int set_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+static void handle_http_request(int fd, char *request, unsigned char *body, size_t content_length) {
+    set_blocking(fd);
+
     struct timeval timeout;
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    struct pollfd poll_fd = {.fd = fd, .events = POLLIN, .revents = 0};
-    int ready;
-    do {
-        ready = poll(&poll_fd, 1, 500);
-    } while (ready < 0 && errno == EINTR);
-    if (ready <= 0 || !(poll_fd.revents & POLLIN)) {
-        return;
-    }
-
-    char request[READ_BUFFER_SIZE];
-    ssize_t n = read(fd, request, sizeof(request) - 1);
-    if (n <= 0) {
-        return;
-    }
-    request[n] = '\0';
-
     char method[16], target[1024], version[16];
     if (sscanf(request, "%15s %1023s %15s", method, target, version) != 3) {
+        free(body);
         send_text_response(fd, 400, "bad request\n");
         return;
     }
     if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0 && strcasecmp(method, "POST") != 0) {
+        free(body);
         send_text_response(fd, 400, "unsupported method\n");
         return;
     }
@@ -1418,12 +1398,6 @@ static void handle_client(int fd) {
     request_header_value(request, "X-Outer-Loop-User", requester_user, sizeof(requester_user));
 
     if (strcasecmp(method, "POST") == 0) {
-        size_t content_length = request_content_length(request);
-        unsigned char *body = read_request_body(fd, request, n, content_length);
-        if (!body && content_length > 0) {
-            send_text_response(fd, 400, "failed to read request body\n");
-            return;
-        }
         if (strcmp(target, "/api/files") == 0) {
             char requested[PATH_MAX];
             if (!read_binary_path_request(body, content_length, FILE_PATH_REQUEST_BINARY_MAGIC, requested, sizeof(requested))) {
@@ -1467,23 +1441,201 @@ static void handle_client(int fd) {
         send_upload_response(fd, query, body, content_length);
         free(body);
     } else if (strcmp(target, "/") == 0 || strcmp(target, "/files.outer") == 0) {
+        free(body);
         send_outer_descriptor(fd);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
+        free(body);
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
     } else if (strcmp(target, kBundleUrlPathMacosArm) == 0) {
+        free(body);
         const char *path = g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm;
         send_bundle_file(fd, path);
     } else if (strcmp(target, kBundleUrlPathMacosX86) == 0) {
+        free(body);
         const char *path = g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86;
         send_bundle_file(fd, path);
     } else if (strcmp(target, "/api/files") == 0) {
+        free(body);
         send_files_response(fd, query, requester_user);
     } else if (strcmp(target, "/api/openers") == 0) {
+        free(body);
         send_openers_response(fd, query, requester_user);
     } else if (strcmp(target, "/api/download") == 0) {
+        free(body);
         send_download_response(fd, query);
     } else {
+        free(body);
         send_text_response(fd, 404, "not found\n");
+    }
+}
+
+static void close_http_client(HttpClient *client) {
+    if (!client) return;
+    if (client->fd >= 0) {
+        close(client->fd);
+    }
+    free(client->body);
+    memset(client, 0, sizeof(*client));
+    client->fd = -1;
+}
+
+static bool http_client_has_complete_request(HttpClient *client) {
+    return client->header_len > 0 && client->body && client->body_len >= client->content_length;
+}
+
+static bool read_http_client_available(HttpClient *client) {
+    while (true) {
+        if (client->header_len == 0) {
+            if (client->request_len + 1 >= sizeof(client->request)) {
+                send_text_response(client->fd, 400, "request headers too large\n");
+                return false;
+            }
+            ssize_t got = read(client->fd,
+                               client->request + client->request_len,
+                               sizeof(client->request) - client->request_len - 1);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+                return false;
+            }
+            if (got == 0) return false;
+            client->request_len += (size_t)got;
+            client->request[client->request_len] = '\0';
+
+            char *headers_end = strstr(client->request, "\r\n\r\n");
+            if (!headers_end) {
+                continue;
+            }
+
+            const char *initial_body = headers_end + 4;
+            client->header_len = (size_t)(initial_body - client->request);
+            client->content_length = request_content_length(client->request);
+            size_t initial_body_len = client->request_len > client->header_len ? client->request_len - client->header_len : 0;
+            if (initial_body_len > client->content_length) initial_body_len = client->content_length;
+            client->body = malloc(client->content_length ? client->content_length : 1);
+            if (!client->body) {
+                send_text_response(client->fd, 500, "out of memory\n");
+                return false;
+            }
+            memcpy(client->body, initial_body, initial_body_len);
+            client->body_len = initial_body_len;
+            client->request[client->header_len] = '\0';
+            if (http_client_has_complete_request(client)) return true;
+        }
+
+        if (client->body_len < client->content_length) {
+            ssize_t got = read(client->fd,
+                               client->body + client->body_len,
+                               client->content_length - client->body_len);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+                return false;
+            }
+            if (got == 0) return false;
+            client->body_len += (size_t)got;
+            if (http_client_has_complete_request(client)) return true;
+            continue;
+        }
+
+        return true;
+    }
+}
+
+static void compact_http_clients(HttpClient *clients, size_t *client_count) {
+    size_t write_index = 0;
+    for (size_t read_index = 0; read_index < *client_count; read_index++) {
+        if (clients[read_index].fd < 0) {
+            continue;
+        }
+        if (write_index != read_index) {
+            clients[write_index] = clients[read_index];
+        }
+        write_index++;
+    }
+    *client_count = write_index;
+}
+
+static void run_server_loop(int listener) {
+    enum { MAX_HTTP_CLIENTS = 128, IDLE_CLIENT_TIMEOUT_SECONDS = 15 };
+    HttpClient clients[MAX_HTTP_CLIENTS];
+    for (size_t i = 0; i < MAX_HTTP_CLIENTS; i++) {
+        clients[i].fd = -1;
+    }
+    size_t client_count = 0;
+    set_nonblocking(listener);
+
+    while (!g_shutdown_requested) {
+        struct pollfd poll_fds[MAX_HTTP_CLIENTS + 1];
+        poll_fds[0].fd = listener;
+        poll_fds[0].events = POLLIN;
+        poll_fds[0].revents = 0;
+        for (size_t i = 0; i < client_count; i++) {
+            poll_fds[i + 1].fd = clients[i].fd;
+            poll_fds[i + 1].events = POLLIN;
+            poll_fds[i + 1].revents = 0;
+        }
+
+        int timeout_ms = g_systemd_socket_activation && client_count == 0 ? 60000 : 1000;
+        int poll_result = poll(poll_fds, (nfds_t)(client_count + 1), timeout_ms);
+        if (poll_result == 0) {
+            if (g_systemd_socket_activation && client_count == 0) {
+                break;
+            }
+        } else if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            break;
+        }
+
+        if (poll_result > 0 && (poll_fds[0].revents & POLLIN)) {
+            while (client_count < MAX_HTTP_CLIENTS) {
+                struct sockaddr_storage peer;
+                socklen_t peer_len = sizeof(peer);
+                int client_fd = accept(listener, (struct sockaddr *)&peer, &peer_len);
+                if (client_fd < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    perror("accept");
+                    g_shutdown_requested = 1;
+                    break;
+                }
+                set_nonblocking(client_fd);
+                HttpClient *client = &clients[client_count++];
+                memset(client, 0, sizeof(*client));
+                client->fd = client_fd;
+                client->accepted_at = time(NULL);
+            }
+        }
+
+        for (size_t i = 0; i < client_count; i++) {
+            HttpClient *client = &clients[i];
+            short revents = poll_fds[i + 1].revents;
+            if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                close_http_client(client);
+                continue;
+            }
+            if ((revents & POLLIN) && !read_http_client_available(client)) {
+                close_http_client(client);
+                continue;
+            }
+            if (http_client_has_complete_request(client)) {
+                handle_http_request(client->fd, client->request, client->body, client->content_length);
+                client->body = NULL;
+                close_http_client(client);
+                continue;
+            }
+            if (client->header_len == 0 && time(NULL) - client->accepted_at > IDLE_CLIENT_TIMEOUT_SECONDS) {
+                close_http_client(client);
+            }
+        }
+        compact_http_clients(clients, &client_count);
+    }
+
+    for (size_t i = 0; i < client_count; i++) {
+        close_http_client(&clients[i]);
     }
 }
 
@@ -1654,34 +1806,7 @@ int main(int argc, char **argv) {
         send_app_announcement_to_outershelld("add", 0, socket_path);
     }
 
-    while (!g_shutdown_requested) {
-        if (g_systemd_socket_activation) {
-            struct pollfd poll_fd = {.fd = listener, .events = POLLIN};
-            int poll_result = poll(&poll_fd, 1, 60000);
-            if (poll_result == 0) {
-                break;
-            }
-            if (poll_result < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                perror("poll");
-                break;
-            }
-        }
-        struct sockaddr_storage peer;
-        socklen_t peer_len = sizeof(peer);
-        int client = accept(listener, (struct sockaddr *)&peer, &peer_len);
-        if (client < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            break;
-        }
-        handle_client(client);
-        close(client);
-    }
+    run_server_loop(listener);
 
     close(listener);
     g_listener_fd = -1;
