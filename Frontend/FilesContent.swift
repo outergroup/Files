@@ -1064,7 +1064,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             if entry.isDirectory {
                 openDirectory(path: entry.path)
             } else {
-                openFileWithDefaultOpener(entry)
+                openFileWithDefaultOpener(entry, openInNewTab: true)
             }
         }
     }
@@ -1502,7 +1502,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
            itemID.hasPrefix("open-"),
            let index = Int(itemID.dropFirst("open-".count)),
            pending.openers.indices.contains(index) {
-            navigateToFile(entry: pending.entry, with: pending.openers[index])
+            navigateToFile(entry: pending.entry, with: pending.openers[index], openInNewTab: false)
             return
         }
 
@@ -1516,7 +1516,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
-    private func openFileWithDefaultOpener(_ entry: FileEntry) {
+    private func openFileWithDefaultOpener(_ entry: FileEntry, openInNewTab: Bool) {
         guard !entry.isDirectory else { return }
         statusLayer.string = ""
         fetchOpeners(for: entry) { [weak self] result in
@@ -1533,18 +1533,22 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 self.statusLayer.string = "No app found for \(entry.name)"
                 return
             }
-            self.navigateToFile(entry: entry, with: opener)
+            self.navigateToFile(entry: entry, with: opener, openInNewTab: openInNewTab)
         }
     }
 
-    private func navigateToFile(entry: FileEntry, with opener: FileOpener) {
+    private func navigateToFile(entry: FileEntry, with opener: FileOpener, openInNewTab: Bool) {
         guard !entry.isDirectory,
               let url = openerNavigationURL(opener) else {
             statusLayer.string = "Could not open \(entry.name)"
             return
         }
         statusLayer.string = ""
-        outerframeHost.navigate(to: url)
+        if openInNewTab {
+            outerframeHost.openNewTab(with: url, displayString: nil)
+        } else {
+            outerframeHost.navigate(to: url)
+        }
     }
 
     private func fetchOpeners(for entry: FileEntry, completion: @escaping @MainActor (FileOpenersFetchResult) -> Void) {
