@@ -39,6 +39,21 @@ private struct FileEntry: Sendable {
     var userCanModify: Bool {
         (accessFlags & 2) != 0
     }
+
+    var isExecutableFile: Bool {
+        guard !isDirectory,
+              mode.count >= 10,
+              mode.first == "-" else {
+            return false
+        }
+        let characters = Array(mode)
+        return characters[3] == "x" ||
+               characters[3] == "s" ||
+               characters[6] == "x" ||
+               characters[6] == "s" ||
+               characters[9] == "x" ||
+               characters[9] == "t"
+    }
 }
 
 private struct DragPreview {
@@ -333,6 +348,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var typeaheadPrefix = ""
     private var typeaheadLastUpdated: Date?
     private var suppressNextMouseUpAfterControlClick = false
+    private var terminalIconCache: [String: CGImage] = [:]
+    private let iconContentsScale: CGFloat = 2
 
     private let favoritesBarHeight: CGFloat = 36
     private let breadcrumbBarHeight: CGFloat = 34
@@ -2079,14 +2096,33 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         if entry.isDirectory {
             return folderIconCGImage(size: size)
         }
+        if entry.isExecutableFile {
+            return terminalIconCGImage(size: size)
+        }
         return fileIconCGImage(for: entry.name, size: size)
+    }
+
+    private func terminalIconCGImage(size: CGSize) -> CGImage? {
+        let cacheKey = "\(Int(size.width.rounded()))x\(Int(size.height.rounded()))-\(Int(iconContentsScale))-\(appearance.name.rawValue)"
+        if let cached = terminalIconCache[cacheKey] {
+            return cached
+        }
+
+        let symbol = NSImage(systemSymbolName: "apple.terminal", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: size.height, weight: .regular))
+        symbol?.isTemplate = true
+        let image = symbol
+            ?? NSWorkspace.shared.icon(for: UTType.unixExecutable)
+        let cgImage = renderedIconCGImage(image: image, size: size)
+        if let cgImage {
+            terminalIconCache[cacheKey] = cgImage
+        }
+        return cgImage
     }
 
     private func fileIconCGImage(for fileName: String, size: CGSize) -> CGImage? {
         let image = fileIcon(for: fileName).copy() as? NSImage ?? fileIcon(for: fileName)
-        image.size = size
-        var rect = NSRect(origin: .zero, size: size)
-        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        return renderedIconCGImage(image: image, size: size)
     }
 
     private func dragPreviewOrigin(forRowAt index: Int) -> CGPoint {
@@ -2373,9 +2409,49 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func folderIconCGImage(size: CGSize) -> CGImage? {
         let image = NSWorkspace.shared.icon(for: UTType.folder).copy() as? NSImage
             ?? NSWorkspace.shared.icon(for: UTType.folder)
+        return renderedIconCGImage(image: image, size: size)
+    }
+
+    private func renderedIconCGImage(image: NSImage, size: CGSize) -> CGImage? {
+        let scale = iconContentsScale
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                            pixelsWide: max(Int(ceil(size.width * scale)), 1),
+                                            pixelsHigh: max(Int(ceil(size.height * scale)), 1),
+                                            bitsPerSample: 8,
+                                            samplesPerPixel: 4,
+                                            hasAlpha: true,
+                                            isPlanar: false,
+                                            colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0,
+                                            bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            return nil
+        }
+
+        bitmap.size = size
         image.size = size
-        var rect = NSRect(origin: .zero, size: size)
-        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.imageInterpolation = .high
+        context.cgContext.scaleBy(x: scale, y: scale)
+        defer {
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        appearance.performAsCurrentDrawingAppearance {
+            NSColor.clear.setFill()
+            NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+            NSColor.labelColor.set()
+            image.draw(in: NSRect(origin: .zero, size: size),
+                       from: .zero,
+                       operation: .sourceOver,
+                       fraction: 1,
+                       respectFlipped: false,
+                       hints: [.interpolation: NSImageInterpolation.high])
+        }
+
+        return bitmap.cgImage
     }
 
     private func textWidth(_ text: String, fontSize: CGFloat, weight: NSFont.Weight) -> CGFloat {
