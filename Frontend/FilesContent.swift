@@ -1224,16 +1224,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
         typeaheadLastUpdated = now
         typeaheadPrefix += text.lowercased()
-        if selectEntry(matchingPrefix: typeaheadPrefix) {
+        if selectEntry(matchingPrefix: typeaheadPrefix, startingAfterSelection: false) {
             return
         }
         typeaheadPrefix = text.lowercased()
-        _ = selectEntry(matchingPrefix: typeaheadPrefix)
+        _ = selectEntry(matchingPrefix: typeaheadPrefix, startingAfterSelection: true)
     }
 
-    private func selectEntry(matchingPrefix prefix: String) -> Bool {
+    private func selectEntry(matchingPrefix prefix: String, startingAfterSelection: Bool) -> Bool {
         guard !prefix.isEmpty else { return false }
-        let start = (selectedIndex ?? -1) + 1
+        let start = startingAfterSelection ? (selectedIndex ?? -1) + 1 : 0
         for offset in 0..<entries.count {
             let index = (start + offset) % entries.count
             if entries[index].name.lowercased().hasPrefix(prefix) {
