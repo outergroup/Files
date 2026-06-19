@@ -1519,7 +1519,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
            itemID.hasPrefix("open-"),
            let index = Int(itemID.dropFirst("open-".count)),
            pending.openers.indices.contains(index) {
-            navigateToFile(entry: pending.entry, with: pending.openers[index], openInNewTab: false)
+            navigateToFile(entry: pending.entry, with: pending.openers[index], openInNewTab: true)
             return
         }
 
