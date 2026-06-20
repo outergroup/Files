@@ -381,6 +381,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private let previewTextSelectionLayer = CALayer()
     private let previewImageLayer = CALayer()
     private let previewImageCaptionLayer = CATextLayer()
+    private let previewOpenFolderLayer = CATextLayer()
     private let previewContentStorage = NSTextContentStorage()
     private let previewTextLayoutManager = NSTextLayoutManager()
     private let previewTextContainer = NSTextContainer(size: .zero)
@@ -459,6 +460,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private let horizontalInset: CGFloat = 18
     private let nameColumnWidth: CGFloat = 0.58
     private let modifiedColumnWidth: CGFloat = 0.24
+    private let rowsScrollbarWidth: CGFloat = 8
+    private let rowsScrollbarInset: CGFloat = 4
     private let previewHeaderHeight: CGFloat = 58
     private let previewMinWindowWidth: CGFloat = 840
     private let previewMinPaneWidth: CGFloat = 380
@@ -629,8 +632,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         let scrollbar = ScrollbarController<FilesRowsScrollbarDelegate>(appConnection: outerframeHost,
                                                                         viewportLayer: rowsClipLayer,
                                                                         appearance: appearance,
-                                                                        width: 8,
-                                                                        inset: 4,
+                                                                        width: rowsScrollbarWidth,
+                                                                        inset: rowsScrollbarInset,
                                                                         scrollOffsetOrigin: .bottom)
         scrollbar.delegate = rowsScrollbarDelegate
         rowsScrollbarController = scrollbar
@@ -644,6 +647,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         disableImplicitActions(for: previewMetaLayer)
         previewClipLayer.masksToBounds = true
         previewClipLayer.addSublayer(previewTextContentLayer)
+        previewClipLayer.addSublayer(previewOpenFolderLayer)
         previewTextContentLayer.addSublayer(previewTextSelectionLayer)
         previewTextContentLayer.addSublayer(previewImageLayer)
         previewTextContentLayer.addSublayer(previewImageCaptionLayer)
@@ -652,9 +656,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         disableImplicitActions(for: previewTextSelectionLayer)
         disableImplicitActions(for: previewImageLayer)
         disableImplicitActions(for: previewImageCaptionLayer)
+        disableImplicitActions(for: previewOpenFolderLayer)
         previewImageLayer.contentsGravity = .resizeAspect
         previewImageLayer.masksToBounds = true
         previewImageLayer.isHidden = true
+        previewOpenFolderLayer.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        previewOpenFolderLayer.fontSize = 14
+        previewOpenFolderLayer.alignmentMode = .center
+        previewOpenFolderLayer.contentsScale = 2
+        previewOpenFolderLayer.isHidden = true
         previewImageCaptionLayer.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         previewImageCaptionLayer.fontSize = 11
         previewImageCaptionLayer.isWrapped = true
@@ -758,7 +768,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
             let headerY = max(height - topChromeHeight - headerHeight, 0)
             headerLayer.frame = CGRect(x: 0, y: headerY, width: listWidth, height: headerHeight)
-            let contentWidth = max(listWidth - horizontalInset * 2, 1)
+            let tableWidth = rowsTableWidth(viewportWidth: listWidth, viewportHeight: headerY)
+            let contentWidth = max(tableWidth - horizontalInset * 2, 1)
             let nameWidth = floor(contentWidth * nameColumnWidth)
             let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
             let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
@@ -811,6 +822,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 previewImageLayer.borderColor = NSColor.separatorColor.cgColor
                 previewImageLayer.borderWidth = 1
                 previewImageCaptionLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                updatePreviewOpenFolderLayerAppearance()
                 rowsScrollbarController?.updateAppearance(appearance)
                 previewScrollbarController?.updateAppearance(appearance)
                 updateFavoritesBar()
@@ -844,6 +856,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                                previewClipLayer.bounds.height))
                 previewScrollOffset = clampedPreviewScroll(previewScrollOffset)
                 updatePreviewTextViewportWithoutAnimations()
+                updatePreviewOpenFolderLayerLayout()
             }
         }
     }
@@ -1088,6 +1101,53 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             previewImageCaptionLayer.isHidden = true
             previewImageCaptionLayer.frame = .zero
         }
+    }
+
+    private func updatePreviewOpenFolderLayerAppearance() {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
+        previewOpenFolderLayer.string = NSAttributedString(string: "Open folder",
+                                                           attributes: [
+                                                            .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+                                                            .foregroundColor: NSColor.controlAccentColor,
+                                                            .paragraphStyle: paragraphStyle
+                                                           ])
+    }
+
+    private func updatePreviewOpenFolderLayerLayout() {
+        guard let entry = selectedFileEntry(),
+              entry.isDirectory,
+              !previewPaneLayer.isHidden,
+              previewClipLayer.bounds.width > 1,
+              previewClipLayer.bounds.height > 1 else {
+            previewOpenFolderLayer.isHidden = true
+            previewOpenFolderLayer.frame = .zero
+            return
+        }
+
+        updatePreviewOpenFolderLayerAppearance()
+        let width: CGFloat = 128
+        let height: CGFloat = 24
+        previewOpenFolderLayer.isHidden = false
+        previewOpenFolderLayer.frame = CGRect(x: floor((previewClipLayer.bounds.width - width) / 2),
+                                              y: floor((previewClipLayer.bounds.height - height) / 2),
+                                              width: width,
+                                              height: height)
+    }
+
+    private func previewOpenFolderEntry(at point: CGPoint) -> FileEntry? {
+        guard !previewOpenFolderLayer.isHidden,
+              let selectedIndex,
+              entries.indices.contains(selectedIndex),
+              entries[selectedIndex].isDirectory else {
+            return nil
+        }
+        let localPoint = previewClipLayer.convert(point, from: rootLayer)
+        guard previewClipLayer.bounds.contains(localPoint),
+              previewOpenFolderLayer.frame.insetBy(dx: -6, dy: -4).contains(localPoint) else {
+            return nil
+        }
+        return entries[selectedIndex]
     }
 
     private func previewImageEntry(at point: CGPoint) -> FileEntry? {
@@ -1388,7 +1448,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func updateCursor(at point: CGPoint) {
-        if isPointOverPreviewText(point) {
+        if previewOpenFolderEntry(at: point) != nil {
+            setCursorIfNeeded(.pointingHand)
+        } else if isPointOverPreviewText(point) {
             setCursorIfNeeded(.iBeam)
         } else {
             setCursorIfNeeded(.arrow)
@@ -2074,8 +2136,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         updateVisibleRows(rebuild: rebuild, notifyAccessibility: true)
     }
 
+    private func rowsContentHeight() -> CGFloat {
+        CGFloat(entries.count) * rowHeight
+    }
+
+    private func rowsScrollbarGutterWidth(viewportHeight: CGFloat) -> CGFloat {
+        rowsContentHeight() > viewportHeight + 0.5 ? rowsScrollbarWidth + rowsScrollbarInset * 2 : 0
+    }
+
+    private func rowsTableWidth(viewportWidth: CGFloat, viewportHeight: CGFloat? = nil) -> CGFloat {
+        let height = viewportHeight ?? rowsClipLayer.bounds.height
+        return max(viewportWidth - rowsScrollbarGutterWidth(viewportHeight: height), 1)
+    }
+
     fileprivate func setRowsScroll(_ value: CGFloat) {
-        let maxOffset = max(CGFloat(entries.count) * rowHeight - rowsClipLayer.bounds.height, 0)
+        let maxOffset = max(rowsContentHeight() - rowsClipLayer.bounds.height, 0)
         let clamped = min(max(value, 0), maxOffset)
         guard abs(clamped - scrollOffset) > 0.001 else {
             updateRowsScrollbarLayout()
@@ -2096,16 +2171,17 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
             let viewportHeight = max(rowsClipLayer.bounds.height, 0)
             let viewportWidth = max(rowsClipLayer.bounds.width, 1)
-            let contentHeight = CGFloat(entries.count) * rowHeight
+            let tableWidth = rowsTableWidth(viewportWidth: viewportWidth, viewportHeight: viewportHeight)
+            let contentHeight = rowsContentHeight()
             scrollOffset = min(max(scrollOffset, 0), max(contentHeight - viewportHeight, 0))
             rowsContentLayer.frame = CGRect(x: 0,
                                             y: viewportHeight - contentHeight + scrollOffset,
-                                            width: viewportWidth,
+                                            width: tableWidth,
                                             height: max(contentHeight, 0))
 
             guard !entries.isEmpty, viewportHeight > 0 else {
                 recycleAllRowLayers()
-                rowsContentLayer.frame = CGRect(origin: .zero, size: CGSize(width: viewportWidth, height: 0))
+                rowsContentLayer.frame = CGRect(origin: .zero, size: CGSize(width: tableWidth, height: 0))
                 updateRowsScrollbarLayout()
                 if notifyAccessibility {
                     notifyAccessibilityLayoutChanged()
@@ -2126,7 +2202,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     visibleRowLayers.removeValue(forKey: index)
                 }
 
-                let contentWidth = max(viewportWidth - horizontalInset * 2, 1)
+                let contentWidth = max(tableWidth - horizontalInset * 2, 1)
                 let nameWidth = floor(contentWidth * nameColumnWidth)
                 let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
                 let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
@@ -2140,7 +2216,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     let entry = entries[index]
                     let isSelected = selectedIndex == index
                     let top = contentHeight - CGFloat(index + 1) * rowHeight
-                    let frame = CGRect(x: 0, y: top, width: viewportWidth, height: rowHeight)
+                    let frame = CGRect(x: 0, y: top, width: tableWidth, height: rowHeight)
                     let rowLayer: CALayer
                     let needsConfigure: Bool
                     if let existing = visibleRowLayers[index] {
@@ -2264,7 +2340,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func rowsScrollbarMetrics() -> ScrollbarController<FilesRowsScrollbarDelegate>.Metrics {
         ScrollbarController.Metrics(viewportSize: rowsClipLayer.bounds.size,
-                                    contentHeight: CGFloat(entries.count) * rowHeight,
+                                    contentHeight: rowsContentHeight(),
                                     scrollOffset: scrollOffset)
     }
 
@@ -2312,6 +2388,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         if previewPaneLayer.frame.contains(point) {
             let previewPoint = previewClipLayer.convert(point, from: rootLayer)
             if previewScrollbarController?.handleMouseDown(at: previewPoint) == true {
+                return
+            }
+            if let entry = previewOpenFolderEntry(at: point) {
+                openDirectory(path: entry.path)
                 return
             }
             if let entry = previewImageEntry(at: point) {
@@ -2553,7 +2633,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func clampScrollOffset() {
-        let maxOffset = max(CGFloat(entries.count) * rowHeight - rowsClipLayer.bounds.height, 0)
+        let maxOffset = max(rowsContentHeight() - rowsClipLayer.bounds.height, 0)
         scrollOffset = min(max(scrollOffset, 0), maxOffset)
     }
 
@@ -3458,11 +3538,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func dragPreviewOrigin(forRowAt index: Int) -> CGPoint {
-        let contentHeight = CGFloat(entries.count) * rowHeight
+        let contentHeight = rowsContentHeight()
         let rowY = contentHeight - CGFloat(index + 1) * rowHeight
         let rowInRowsClip = CGRect(x: 0,
                                    y: rowsContentLayer.frame.minY + rowY,
-                                   width: rowsClipLayer.bounds.width,
+                                   width: rowsTableWidth(viewportWidth: rowsClipLayer.bounds.width),
                                    height: rowHeight)
         let rowInRoot = rowsClipLayer.convert(rowInRowsClip, to: rootLayer)
         return CGPoint(x: rowInRoot.minX + horizontalInset,
@@ -3474,7 +3554,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         let font = NSFont.systemFont(ofSize: 13, weight: .regular)
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byTruncatingMiddle
-        let contentWidth = max(rowsClipLayer.bounds.width - horizontalInset * 2, 1)
+        let contentWidth = max(rowsTableWidth(viewportWidth: rowsClipLayer.bounds.width) - horizontalInset * 2, 1)
         let nameWidth = max(floor(contentWidth * nameColumnWidth) - 24, 1)
         let measuredNameWidth = ceil((entry.name as NSString).size(withAttributes: [.font: font]).width)
         let textWidth = min(max(measuredNameWidth, 1), max(nameWidth, 1))
@@ -3543,7 +3623,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func rowIndex(at point: CGPoint) -> Int {
         let localPoint = rowsClipLayer.convert(point, from: rootLayer)
-        guard rowsClipLayer.bounds.contains(localPoint) else { return -1 }
+        guard rowsClipLayer.bounds.contains(localPoint),
+              localPoint.x <= rowsTableWidth(viewportWidth: rowsClipLayer.bounds.width) else { return -1 }
         return Int(floor((rowsClipLayer.bounds.height - localPoint.y + scrollOffset) / rowHeight))
     }
 
@@ -3844,6 +3925,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                              frame: previewPaneLayer.frame,
                                              label: previewEntryName.isEmpty ? "File preview" : "Preview of \(previewEntryName)",
                                              value: previewMessage.isEmpty ? previewBodyText : previewMessage))
+            if !previewOpenFolderLayer.isHidden,
+               let entry = selectedFileEntry(),
+               entry.isDirectory {
+                children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                                 role: .button,
+                                                 frame: previewClipLayer.convert(previewOpenFolderLayer.frame, to: rootLayer),
+                                                 label: "Open",
+                                                 value: entry.path,
+                                                 hint: "Open folder"))
+            }
         }
 
         if let status = statusLayer.string as? String, !status.isEmpty {
@@ -3891,7 +3982,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func buildFileTableAccessibilityNode(nextIdentifier: inout UInt32) -> OuterframeAccessibilityNode {
         var rowNodes: [OuterframeAccessibilityNode] = []
-        let contentWidth = max(rowsClipLayer.bounds.width - horizontalInset * 2, 1)
+        let tableWidth = rowsTableWidth(viewportWidth: rowsClipLayer.bounds.width)
+        let contentWidth = max(tableWidth - horizontalInset * 2, 1)
         let nameWidth = floor(contentWidth * nameColumnWidth)
         let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
         let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
@@ -3903,7 +3995,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             for index in visibleStart..<visibleEnd {
                 let entry = entries[index]
                 let top = rowsClipLayer.bounds.height - CGFloat(index) * rowHeight + scrollOffset - rowHeight
-                let rowFrame = CGRect(x: 0, y: top, width: rowsClipLayer.bounds.width, height: rowHeight)
+                let rowFrame = CGRect(x: 0, y: top, width: tableWidth, height: rowHeight)
                 let type = entry.isDirectory ? "Folder" : "File"
                 let size = entry.isDirectory ? "" : formatByteCount(entry.size)
                 let selectedPrefix = selectedIndex == index ? "Selected, " : ""
