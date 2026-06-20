@@ -30,6 +30,8 @@
 
 #define DEFAULT_PORT 7354
 #define READ_BUFFER_SIZE 8192
+#define FILE_TEXT_PREVIEW_MAX_BYTES (256 * 1024)
+#define FILE_MEDIA_PREVIEW_MAX_BYTES (16 * 1024 * 1024)
 
 static const char *kBundleUrlPath = "/bundles/FilesContent";
 static const char *kBundleUrlPathMacosArm = "/bundles/FilesContent/macos-arm";
@@ -89,6 +91,34 @@ typedef struct {
 
 static bool query_value(const char *query, const char *name, char *dst, size_t dst_size);
 static void resolve_requested_path(const char *requested, char *resolved, size_t resolved_size);
+
+static const char *path_extension(const char *path) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    const char *dot = strrchr(name, '.');
+    return dot && dot[1] != '\0' ? dot + 1 : "";
+}
+
+static const char *preview_content_type_for_path(const char *path) {
+    const char *ext = path_extension(path);
+    if (strcasecmp(ext, "png") == 0) return "image/png";
+    if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, "gif") == 0) return "image/gif";
+    if (strcasecmp(ext, "webp") == 0) return "image/webp";
+    if (strcasecmp(ext, "tif") == 0 || strcasecmp(ext, "tiff") == 0) return "image/tiff";
+    if (strcasecmp(ext, "bmp") == 0) return "image/bmp";
+    if (strcasecmp(ext, "heic") == 0) return "image/heic";
+    if (strcasecmp(ext, "heif") == 0) return "image/heif";
+    if (strcasecmp(ext, "ico") == 0) return "image/x-icon";
+    if (strcasecmp(ext, "icns") == 0) return "image/icns";
+    if (strcasecmp(ext, "svg") == 0 || strcasecmp(ext, "svgz") == 0) return "image/svg+xml";
+    if (strcasecmp(ext, "pdf") == 0) return "application/pdf";
+    return "text/plain; charset=utf-8";
+}
+
+static bool preview_content_type_is_text(const char *content_type) {
+    return strncasecmp(content_type, "text/", 5) == 0;
+}
 
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
@@ -155,13 +185,14 @@ static void send_text_response(int fd, int status, const char *message) {
     const char *status_text = status == 200 ? "OK" :
                               status == 400 ? "Bad Request" :
                               status == 404 ? "Not Found" :
+                              status == 413 ? "Payload Too Large" :
                               status == 502 ? "Bad Gateway" :
                               status == 500 ? "Internal Server Error" : "Error";
     send_response(fd, status, status_text, "text/plain; charset=utf-8", message, strlen(message));
 }
 
 static void send_outer_descriptor(int fd) {
-    const char *plugin_json = "{\"filesAPIPath\":\"/api/files\",\"openersAPIPath\":\"/api/openers\",\"rootPath\":\"~\"}";
+    const char *plugin_json = "{\"filesAPIPath\":\"/api/files\",\"openersAPIPath\":\"/api/openers\",\"previewAPIPath\":\"/api/preview\",\"rootPath\":\"~\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_json);
     size_t header_len = 40;
@@ -1199,6 +1230,76 @@ static void send_files_response(int fd, const char *query, const char *requester
     send_files_response_for_path(fd, requested, requester_user);
 }
 
+static void send_preview_response_for_path(int fd, const char *requested) {
+    char path[PATH_MAX];
+    resolve_requested_path(requested, path, sizeof(path));
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        send_text_response(fd, 404, "file not found\n");
+        return;
+    }
+
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        char message[PATH_MAX + 80];
+        snprintf(message, sizeof(message), "failed to open %s: %s\n", path, strerror(errno));
+        send_text_response(fd, 404, message);
+        return;
+    }
+
+    const char *content_type = preview_content_type_for_path(path);
+    bool is_text_preview = preview_content_type_is_text(content_type);
+    size_t max_bytes = is_text_preview ? FILE_TEXT_PREVIEW_MAX_BYTES : FILE_MEDIA_PREVIEW_MAX_BYTES;
+
+    if (!is_text_preview && (uint64_t)st.st_size > (uint64_t)max_bytes) {
+        char message[PATH_MAX + 128];
+        snprintf(message, sizeof(message), "preview is too large: %s exceeds 16 MiB\n", path);
+        close(file_fd);
+        send_text_response(fd, 413, message);
+        return;
+    }
+
+    const char *truncation_notice = "\n\n[Preview truncated at 256 KiB]\n";
+    size_t notice_len = strlen(truncation_notice);
+    size_t capacity = max_bytes + (is_text_preview ? notice_len : 0);
+    char *buffer = malloc(capacity ? capacity : 1);
+    if (!buffer) {
+        close(file_fd);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+
+    size_t offset = 0;
+    while (offset < max_bytes) {
+        ssize_t got = read(file_fd, buffer + offset, max_bytes - offset);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            char message[PATH_MAX + 80];
+            snprintf(message, sizeof(message), "failed to read %s: %s\n", path, strerror(errno));
+            free(buffer);
+            close(file_fd);
+            send_text_response(fd, 500, message);
+            return;
+        }
+        if (got == 0) {
+            break;
+        }
+        offset += (size_t)got;
+    }
+    close(file_fd);
+
+    if (is_text_preview && (uint64_t)st.st_size > (uint64_t)offset && offset + notice_len <= capacity) {
+        memcpy(buffer + offset, truncation_notice, notice_len);
+        offset += notice_len;
+    }
+
+    send_response(fd, 200, "OK", content_type, buffer, offset);
+    free(buffer);
+}
+
 static void send_download_response(int fd, const char *query) {
     char requested[PATH_MAX];
     char path[PATH_MAX];
@@ -1417,6 +1518,17 @@ static void handle_http_request(int fd, char *request, unsigned char *body, size
                 return;
             }
             send_openers_response_for_path(fd, requested, requester_user);
+            free(body);
+            return;
+        }
+        if (strcmp(target, "/api/preview") == 0) {
+            char requested[PATH_MAX];
+            if (!read_binary_path_request(body, content_length, FILE_PATH_REQUEST_BINARY_MAGIC, requested, sizeof(requested))) {
+                free(body);
+                send_text_response(fd, 400, "bad preview request\n");
+                return;
+            }
+            send_preview_response_for_path(fd, requested);
             free(body);
             return;
         }

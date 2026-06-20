@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import ImageIO
 import QuartzCore
 import UniformTypeIdentifiers
 
@@ -78,6 +79,66 @@ private struct FileOpenMenuAction {
 private enum FileOpenersFetchResult {
     case success([FileOpener])
     case failure(String)
+}
+
+private enum FilePreviewKind {
+    case text
+    case media
+}
+
+private final class PreviewTextFragmentLayer: CALayer {
+    var appearance: NSAppearance = .currentDrawing() {
+        didSet {
+            if appearance.name != oldValue.name {
+                setNeedsDisplay()
+            }
+        }
+    }
+    var textLayoutFragment: NSTextLayoutFragment? {
+        didSet {
+            if textLayoutFragment !== oldValue {
+                setNeedsDisplay()
+            }
+        }
+    }
+    var renderingSurfaceOffset: CGPoint = .zero {
+        didSet {
+            if renderingSurfaceOffset != oldValue {
+                setNeedsDisplay()
+            }
+        }
+    }
+
+    override init() {
+        super.init()
+        contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    override init(layer: Any) {
+        super.init(layer: layer)
+        if let layer = layer as? PreviewTextFragmentLayer {
+            appearance = layer.appearance
+            textLayoutFragment = layer.textLayoutFragment
+            renderingSurfaceOffset = layer.renderingSurfaceOffset
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(in context: CGContext) {
+        guard let textLayoutFragment else { return }
+        appearance.performAsCurrentDrawingAppearance {
+            context.saveGState()
+            context.translateBy(x: 0, y: bounds.height)
+            context.scaleBy(x: 1, y: -1)
+            textLayoutFragment.draw(at: CGPoint(x: -renderingSurfaceOffset.x,
+                                                y: -renderingSurfaceOffset.y),
+                                    in: context)
+            context.restoreGState()
+        }
+    }
 }
 
 private enum FileOpenersBinaryFormat {
@@ -311,12 +372,25 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private let rowsClipLayer = CALayer()
     private let rowsContentLayer = CALayer()
     private let statusLayer = CATextLayer()
+    private let previewDividerLayer = CALayer()
+    private let previewPaneLayer = CALayer()
+    private let previewTitleLayer = CATextLayer()
+    private let previewMetaLayer = CATextLayer()
+    private let previewClipLayer = CALayer()
+    private let previewTextContentLayer = CALayer()
+    private let previewTextSelectionLayer = CALayer()
+    private let previewImageLayer = CALayer()
+    private let previewImageCaptionLayer = CATextLayer()
+    private let previewContentStorage = NSTextContentStorage()
+    private let previewTextLayoutManager = NSTextLayoutManager()
+    private let previewTextContainer = NSTextContainer(size: .zero)
 
     private var appearance = NSAppearance.currentDrawing()
     private var currentSize = CGSize(width: 900, height: 600)
     private var urlSession: URLSession?
     private var filesEndpoint: URL?
     private var openersEndpoint: URL?
+    private var previewEndpoint: URL?
     private var downloadEndpoint: URL?
     private var uploadEndpoint: URL?
     private var mkdirEndpoint: URL?
@@ -339,6 +413,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var breadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
     private lazy var rowsScrollbarDelegate = FilesRowsScrollbarDelegate(owner: self)
     private var rowsScrollbarController: ScrollbarController<FilesRowsScrollbarDelegate>?
+    private lazy var previewScrollbarDelegate = FilesPreviewScrollbarDelegate(owner: self)
+    private var previewScrollbarController: ScrollbarController<FilesPreviewScrollbarDelegate>?
     private var visibleRowLayers: [Int: CALayer] = [:]
     private var reusableRowLayers: [CALayer] = []
     private var pendingDirectoryMenuEntries: [UUID: FileEntry] = [:]
@@ -350,6 +426,31 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var suppressNextMouseUpAfterControlClick = false
     private var terminalIconCache: [String: CGImage] = [:]
     private let iconContentsScale: CGFloat = 2
+    private var previewPath: String?
+    private var previewEntryName = ""
+    private var previewBodyText = ""
+    private var previewMessage = ""
+    private var previewImage: CGImage?
+    private var previewImageNaturalSize = CGSize.zero
+    private var previewImageCaptionText = ""
+    private var previewIsLoading = false
+    private var previewScrollOffset: CGFloat = 0
+    private var previewRequestGeneration = 0
+    private var previewRenderedText = ""
+    private var previewAttributedText = NSAttributedString(string: "")
+    private var previewTextContentGeneration = 0
+    private var previewTextLayoutWidth: CGFloat = 0
+    private var previewTextFragmentLayers: [ObjectIdentifier: PreviewTextFragmentLayer] = [:]
+    private var previewTextSelectionLayers: [CALayer] = []
+    private var previewTextFragmentCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, rect: CGRect)?
+    private var previewTextSelectionCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, range: NSRange, rect: CGRect)?
+    private var previewContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
+    private var previewTextSelectionRange: NSRange?
+    private var previewDragAnchorOffset: Int?
+    private var lastPreviewDragTextPoint: CGPoint?
+    private var previewImageDragCandidateEntry: FileEntry?
+    private var previewImageDragStartPoint: CGPoint?
+    private var currentCursor: PluginCursorType = .arrow
 
     private let favoritesBarHeight: CGFloat = 36
     private let breadcrumbBarHeight: CGFloat = 34
@@ -358,9 +459,20 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private let horizontalInset: CGFloat = 18
     private let nameColumnWidth: CGFloat = 0.58
     private let modifiedColumnWidth: CGFloat = 0.24
+    private let previewHeaderHeight: CGFloat = 58
+    private let previewMinWindowWidth: CGFloat = 840
+    private let previewMinPaneWidth: CGFloat = 380
+    private let previewMaxPaneWidth: CGFloat = 720
+    private let previewTextInsetX: CGFloat = 12
+    private let previewTextInsetY: CGFloat = 10
+    private let previewTextMeasurementHeight: CGFloat = 1_000_000
 
     private var topChromeHeight: CGFloat {
         favoritesBarHeight + breadcrumbBarHeight
+    }
+
+    private var shouldShowPreviewPane: Bool {
+        true
     }
 
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
@@ -404,9 +516,18 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             updateColors()
 
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
+            if previewPaneLayer.frame.contains(point),
+               previewClipLayer.bounds.contains(previewClipLayer.convert(point, from: rootLayer)) {
+                let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
+                setPreviewScroll(previewScrollOffset - delta.y * multiplier)
+                return
+            }
             guard rowsClipLayer.frame.contains(rootLayer.convert(point, to: rowsClipLayer.superlayer)) else { return }
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
             setRowsScroll(scrollOffset - delta.y * multiplier)
+
+        case .mouseMoved(let point, _):
+            updateCursor(at: point)
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
             if modifierFlags.contains(.control) {
@@ -414,7 +535,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 handleRightMouseDown(at: point)
             } else {
                 suppressNextMouseUpAfterControlClick = false
-                handleMouseDown(at: point, clickCount: clickCount)
+                handleMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
             }
 
         case .mouseDragged(let point, let modifierFlags):
@@ -480,6 +601,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         if let base = outerframeHost.pluginBaseURL() {
             filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
             openersEndpoint = URL(string: "/api/openers", relativeTo: base)?.absoluteURL
+            previewEndpoint = URL(string: "/api/preview", relativeTo: base)?.absoluteURL
             downloadEndpoint = URL(string: "/api/download", relativeTo: base)?.absoluteURL
             uploadEndpoint = URL(string: "/api/upload", relativeTo: base)?.absoluteURL
             mkdirEndpoint = URL(string: "/api/mkdir", relativeTo: base)?.absoluteURL
@@ -500,6 +622,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         rootLayer.addSublayer(headerLayer)
         rootLayer.addSublayer(rowsClipLayer)
         rootLayer.addSublayer(statusLayer)
+        rootLayer.addSublayer(previewDividerLayer)
+        rootLayer.addSublayer(previewPaneLayer)
         rowsClipLayer.masksToBounds = true
         rowsClipLayer.addSublayer(rowsContentLayer)
         let scrollbar = ScrollbarController<FilesRowsScrollbarDelegate>(appConnection: outerframeHost,
@@ -511,11 +635,50 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         scrollbar.delegate = rowsScrollbarDelegate
         rowsScrollbarController = scrollbar
 
+        previewPaneLayer.masksToBounds = true
+        previewPaneLayer.addSublayer(previewTitleLayer)
+        previewPaneLayer.addSublayer(previewMetaLayer)
+        previewPaneLayer.addSublayer(previewClipLayer)
+        disableImplicitActions(for: previewPaneLayer)
+        disableImplicitActions(for: previewTitleLayer)
+        disableImplicitActions(for: previewMetaLayer)
+        previewClipLayer.masksToBounds = true
+        previewClipLayer.addSublayer(previewTextContentLayer)
+        previewTextContentLayer.addSublayer(previewTextSelectionLayer)
+        previewTextContentLayer.addSublayer(previewImageLayer)
+        previewTextContentLayer.addSublayer(previewImageCaptionLayer)
+        disableImplicitActions(for: previewClipLayer)
+        disableImplicitActions(for: previewTextContentLayer)
+        disableImplicitActions(for: previewTextSelectionLayer)
+        disableImplicitActions(for: previewImageLayer)
+        disableImplicitActions(for: previewImageCaptionLayer)
+        previewImageLayer.contentsGravity = .resizeAspect
+        previewImageLayer.masksToBounds = true
+        previewImageLayer.isHidden = true
+        previewImageCaptionLayer.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        previewImageCaptionLayer.fontSize = 11
+        previewImageCaptionLayer.isWrapped = true
+        previewImageCaptionLayer.contentsScale = 2
+        previewImageCaptionLayer.isHidden = true
+        let previewScrollbar = ScrollbarController<FilesPreviewScrollbarDelegate>(appConnection: outerframeHost,
+                                                                                  viewportLayer: previewClipLayer,
+                                                                                  appearance: appearance,
+                                                                                  width: 9,
+                                                                                  inset: 5,
+                                                                                  scrollOffsetOrigin: .bottom)
+        previewScrollbar.delegate = previewScrollbarDelegate
+        previewScrollbarController = previewScrollbar
+
+        previewTextContainer.lineFragmentPadding = 0
+        previewTextLayoutManager.textContainer = previewTextContainer
+        previewTextLayoutManager.usesFontLeading = true
+        previewContentStorage.addTextLayoutManager(previewTextLayoutManager)
+
         headerLayer.addSublayer(nameHeaderLayer)
         headerLayer.addSublayer(modifiedHeaderLayer)
         headerLayer.addSublayer(sizeHeaderLayer)
 
-        for layer in [nameHeaderLayer, modifiedHeaderLayer, sizeHeaderLayer, statusLayer] {
+        for layer in [nameHeaderLayer, modifiedHeaderLayer, sizeHeaderLayer, statusLayer, previewTitleLayer, previewMetaLayer] {
             layer.font = NSFont.systemFont(ofSize: 12, weight: .medium)
             layer.fontSize = 12
             layer.contentsScale = 2
@@ -526,6 +689,54 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         sizeHeaderLayer.string = "Size"
         sizeHeaderLayer.alignmentMode = .right
         statusLayer.alignmentMode = .center
+        previewTitleLayer.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        previewTitleLayer.fontSize = 13
+        previewMetaLayer.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        previewMetaLayer.fontSize = 11
+    }
+
+    private func resolvedPreviewWidth(for totalWidth: CGFloat) -> CGFloat {
+        guard shouldShowPreviewPane, totalWidth >= previewMinWindowWidth else { return 0 }
+        let desired = min(max(floor(totalWidth * 0.46), previewMinPaneWidth), previewMaxPaneWidth)
+        let maximum = max(totalWidth - 360, 0)
+        return min(desired, maximum)
+    }
+
+    private func layoutPreviewPane(totalWidth: CGFloat,
+                                   listWidth: CGFloat,
+                                   previewWidth: CGFloat,
+                                   height: CGFloat) {
+        let isVisible = previewWidth > 0.5
+        previewPaneLayer.isHidden = !isVisible
+        previewDividerLayer.isHidden = !isVisible
+        guard isVisible else {
+            previewPaneLayer.frame = .zero
+            previewDividerLayer.frame = .zero
+            clearPreviewTextSelectionLayers()
+            return
+        }
+
+        let paneHeight = max(height - topChromeHeight, 0)
+        previewDividerLayer.frame = CGRect(x: listWidth,
+                                           y: 0,
+                                           width: 1,
+                                           height: paneHeight)
+        previewPaneLayer.frame = CGRect(x: listWidth + 1,
+                                        y: 0,
+                                        width: max(previewWidth - 1, 1),
+                                        height: paneHeight)
+        previewTitleLayer.frame = CGRect(x: previewTextInsetX,
+                                         y: max(paneHeight - 28, 0),
+                                         width: max(previewPaneLayer.bounds.width - previewTextInsetX * 2, 1),
+                                         height: 18)
+        previewMetaLayer.frame = CGRect(x: previewTextInsetX,
+                                        y: max(paneHeight - 46, 0),
+                                        width: max(previewPaneLayer.bounds.width - previewTextInsetX * 2, 1),
+                                        height: 14)
+        previewClipLayer.frame = CGRect(x: 0,
+                                        y: 0,
+                                        width: previewPaneLayer.bounds.width,
+                                        height: max(paneHeight - previewHeaderHeight, 0))
     }
 
     private func updateLayout() {
@@ -533,19 +744,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             let width = max(currentSize.width, 1)
             let height = max(currentSize.height, 1)
             rootLayer.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+            let previewWidth = resolvedPreviewWidth(for: width)
+            let listWidth = max(width - previewWidth, 1)
 
             favoritesBarLayer.frame = CGRect(x: 0,
                                              y: max(height - favoritesBarHeight, 0),
-                                             width: width,
+                                             width: listWidth,
                                              height: favoritesBarHeight)
             breadcrumbBarLayer.frame = CGRect(x: 0,
                                               y: max(height - topChromeHeight, 0),
-                                              width: width,
+                                              width: listWidth,
                                               height: breadcrumbBarHeight)
 
             let headerY = max(height - topChromeHeight - headerHeight, 0)
-            headerLayer.frame = CGRect(x: 0, y: headerY, width: width, height: headerHeight)
-            let contentWidth = max(width - horizontalInset * 2, 1)
+            headerLayer.frame = CGRect(x: 0, y: headerY, width: listWidth, height: headerHeight)
+            let contentWidth = max(listWidth - horizontalInset * 2, 1)
             let nameWidth = floor(contentWidth * nameColumnWidth)
             let modifiedWidth = floor(contentWidth * modifiedColumnWidth)
             let sizeWidth = max(contentWidth - nameWidth - modifiedWidth, 1)
@@ -553,12 +766,18 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             modifiedHeaderLayer.frame = CGRect(x: horizontalInset + nameWidth, y: 7, width: modifiedWidth, height: 16)
             sizeHeaderLayer.frame = CGRect(x: horizontalInset + nameWidth + modifiedWidth, y: 7, width: sizeWidth, height: 16)
 
-            rowsClipLayer.frame = CGRect(x: 0, y: 0, width: width, height: headerY)
+            rowsClipLayer.frame = CGRect(x: 0, y: 0, width: listWidth, height: headerY)
             statusLayer.frame = CGRect(x: horizontalInset, y: max(headerY - 30, 0), width: contentWidth, height: 18)
+
+            layoutPreviewPane(totalWidth: width,
+                              listWidth: listWidth,
+                              previewWidth: previewWidth,
+                              height: height)
             clampScrollOffset()
             updateFavoritesBar()
             updateBreadcrumbBar()
             updateRows(rebuild: true)
+            renderPreviewPane()
         }
         notifyAccessibilityLayoutChanged()
     }
@@ -584,12 +803,712 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 modifiedHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 sizeHeaderLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                previewPaneLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
+                previewDividerLayer.backgroundColor = NSColor.separatorColor.cgColor
+                previewTitleLayer.foregroundColor = NSColor.labelColor.cgColor
+                previewMetaLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                previewImageLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
+                previewImageLayer.borderColor = NSColor.separatorColor.cgColor
+                previewImageLayer.borderWidth = 1
+                previewImageCaptionLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 rowsScrollbarController?.updateAppearance(appearance)
+                previewScrollbarController?.updateAppearance(appearance)
                 updateFavoritesBar()
                 updateBreadcrumbBar()
                 updateRows(rebuild: true)
+                updatePreviewTextContentIfNeeded(force: true)
+                renderPreviewPane()
             }
         }
+    }
+
+    private func renderPreviewPane() {
+        guard !previewPaneLayer.isHidden else {
+            clearPreviewTextFragmentLayers()
+            return
+        }
+
+        appearance.performAsCurrentDrawingAppearance {
+            withoutImplicitAnimations {
+                previewTitleLayer.string = previewEntryName.isEmpty ? "Preview" : previewEntryName
+                previewMetaLayer.string = previewPath ?? ""
+                let textWidth = max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1)
+                if abs(textWidth - previewTextLayoutWidth) > 0.5 {
+                    previewTextLayoutWidth = textWidth
+                    previewContentHeightCache = nil
+                    clearPreviewTextFragmentLayers()
+                }
+                updatePreviewTextContentIfNeeded()
+                previewTextContainer.size = CGSize(width: textWidth,
+                                                   height: max(previewContentHeight(textWidth: textWidth) - previewTextInsetY * 2,
+                                                               previewClipLayer.bounds.height))
+                previewScrollOffset = clampedPreviewScroll(previewScrollOffset)
+                updatePreviewTextViewportWithoutAnimations()
+            }
+        }
+    }
+
+    private func updatePreviewTextContentIfNeeded(force: Bool = false) {
+        let displayText: String
+        if previewBodyText.isEmpty, !previewMessage.isEmpty {
+            displayText = previewMessage
+        } else if previewBodyText.isEmpty, previewImage != nil {
+            displayText = ""
+        } else if previewBodyText.isEmpty {
+            displayText = " "
+        } else if previewMessage.isEmpty {
+            displayText = previewBodyText
+        } else {
+            displayText = "\(previewBodyText)\n\n\(previewMessage)"
+        }
+
+        guard force || displayText != previewRenderedText else { return }
+        previewRenderedText = displayText
+        previewTextContentGeneration += 1
+        previewContentHeightCache = nil
+        previewAttributedText = makePreviewAttributedText(displayText, isMessage: previewBodyText.isEmpty && !previewMessage.isEmpty)
+        previewContentStorage.attributedString = previewAttributedText
+        previewTextSelectionRange = nil
+        previewTextLayoutManager.textSelections = []
+        clearPreviewTextFragmentLayers()
+        clearPreviewTextSelectionLayers()
+    }
+
+    private func setPreviewImage(_ image: CGImage?, naturalSize: CGSize = .zero, captionText: String = "") {
+        withoutImplicitAnimations {
+            previewImage = image
+            previewImageNaturalSize = naturalSize
+            previewImageCaptionText = captionText
+            previewImageLayer.contents = image
+            previewImageLayer.isHidden = image == nil
+            previewImageCaptionLayer.string = captionText
+            previewImageCaptionLayer.isHidden = image == nil || captionText.isEmpty
+            previewTextContentGeneration += 1
+            previewContentHeightCache = nil
+            previewTextFragmentCoverage = nil
+            previewTextSelectionCoverage = nil
+        }
+    }
+
+    private func makePreviewAttributedText(_ text: String, isMessage: Bool) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byCharWrapping
+        paragraph.lineSpacing = 2
+        return NSAttributedString(string: text,
+                                  attributes: [
+                                    .font: previewTextFont(),
+                                    .foregroundColor: isMessage ? NSColor.secondaryLabelColor : NSColor.labelColor,
+                                    .paragraphStyle: paragraph
+                                  ])
+    }
+
+    private func previewTextFont() -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    }
+
+    private func previewContentHeight() -> CGFloat {
+        guard previewClipLayer.bounds.width > 0, previewClipLayer.bounds.height > 0 else { return 0 }
+        let textWidth = max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1)
+        return previewContentHeight(textWidth: textWidth)
+    }
+
+    private func previewContentHeight(textWidth: CGFloat) -> CGFloat {
+        if let cache = previewContentHeightCache,
+           cache.generation == previewTextContentGeneration,
+           abs(cache.textWidth - textWidth) <= 0.5 {
+            return cache.height
+        }
+
+        previewTextContainer.size = CGSize(width: textWidth,
+                                           height: max(previewTextMeasurementHeight, previewClipLayer.bounds.height))
+        previewTextLayoutManager.ensureLayout(for: previewTextLayoutManager.documentRange)
+        let imageSize = previewImageDisplaySize(textWidth: textWidth)
+        let captionHeight = previewImageCaptionHeight(textWidth: textWidth)
+        let imageHeight = imageSize.height > 0 ? imageSize.height + 14 + captionHeight : 0
+        let height = max(previewTextLayoutManager.usageBoundsForTextContainer.maxY + imageHeight + previewTextInsetY * 2,
+                         previewClipLayer.bounds.height)
+        previewContentHeightCache = (generation: previewTextContentGeneration,
+                                     textWidth: textWidth,
+                                     height: height)
+        return height
+    }
+
+    private func previewTextOnlyHeight(textWidth: CGFloat) -> CGFloat {
+        previewTextContainer.size = CGSize(width: textWidth,
+                                           height: max(previewTextMeasurementHeight, previewClipLayer.bounds.height))
+        previewTextLayoutManager.ensureLayout(for: previewTextLayoutManager.documentRange)
+        return max(previewTextLayoutManager.usageBoundsForTextContainer.maxY, 0)
+    }
+
+    private func previewImageDisplaySize(textWidth: CGFloat) -> CGSize {
+        guard previewImage != nil,
+              previewImageNaturalSize.width > 0,
+              previewImageNaturalSize.height > 0,
+              textWidth > 0 else {
+            return .zero
+        }
+        let scale = min(1, textWidth / previewImageNaturalSize.width)
+        return CGSize(width: max(floor(previewImageNaturalSize.width * scale), 1),
+                      height: max(floor(previewImageNaturalSize.height * scale), 1))
+    }
+
+    private func previewImageCaptionHeight(textWidth: CGFloat) -> CGFloat {
+        guard previewImage != nil, !previewImageCaptionText.isEmpty, textWidth > 0 else { return 0 }
+        let font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byWordWrapping
+        let rect = (previewImageCaptionText as NSString).boundingRect(with: CGSize(width: textWidth, height: 1_000),
+                                                                      options: [.usesLineFragmentOrigin, .usesFontLeading],
+                                                                      attributes: [
+                                                                        .font: font,
+                                                                        .paragraphStyle: paragraphStyle
+                                                                      ])
+        return ceil(rect.height) + 12
+    }
+
+    private func updatePreviewTextViewport() {
+        withoutImplicitAnimations {
+            updatePreviewTextViewportWithoutAnimations()
+        }
+    }
+
+    private func updatePreviewTextViewportWithoutAnimations() {
+        guard previewClipLayer.bounds.width > 0, previewClipLayer.bounds.height > 0 else {
+            clearPreviewTextFragmentLayers()
+            return
+        }
+
+        let textWidth = max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1)
+        let contentHeight = max(previewContentHeight() - previewTextInsetY * 2, previewClipLayer.bounds.height)
+        previewTextContentLayer.frame = CGRect(x: previewTextInsetX,
+                                               y: previewClipLayer.bounds.height - previewTextInsetY - contentHeight + previewScrollOffset,
+                                               width: textWidth,
+                                               height: contentHeight)
+        previewTextSelectionLayer.frame = CGRect(x: 0, y: 0, width: textWidth, height: contentHeight)
+        updatePreviewImageLayout(textWidth: textWidth, contentHeight: contentHeight)
+        updatePreviewScrollbarLayout()
+
+        let visibleTextRect = visiblePreviewTextContentRect()
+        if let coverage = previewTextFragmentCoverage,
+           coverage.generation == previewTextContentGeneration,
+           abs(coverage.textWidth - textWidth) <= 0.5,
+           abs(coverage.contentHeight - contentHeight) <= 0.5,
+           coverage.rect.contains(visibleTextRect) {
+            return
+        }
+
+        let layoutRect = expandedPreviewTextContentRect(containing: visibleTextRect,
+                                                        contentHeight: contentHeight)
+        previewTextLayoutManager.ensureLayout(for: layoutRect)
+        let startLocation = previewTextLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: max(layoutRect.minY, 0)))?.rangeInElement.location
+            ?? previewTextLayoutManager.documentRange.location
+
+        var visibleFragmentIDs = Set<ObjectIdentifier>()
+        previewTextLayoutManager.enumerateTextLayoutFragments(from: startLocation,
+                                                              options: [.ensuresLayout]) { fragment in
+            let frame = fragment.layoutFragmentFrame
+            if frame.minY > layoutRect.maxY {
+                return false
+            }
+            guard frame.maxY >= layoutRect.minY else {
+                return true
+            }
+
+            let id = ObjectIdentifier(fragment)
+            visibleFragmentIDs.insert(id)
+            let layer = self.previewTextFragmentLayers[id] ?? {
+                let layer = PreviewTextFragmentLayer()
+                disableImplicitActions(for: layer)
+                layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+                self.previewTextContentLayer.addSublayer(layer)
+                self.previewTextFragmentLayers[id] = layer
+                return layer
+            }()
+            layer.appearance = self.appearance
+            layer.textLayoutFragment = fragment
+            let surface = fragment.renderingSurfaceBounds
+            let topDownFrame = CGRect(x: frame.minX + surface.minX,
+                                      y: frame.minY + surface.minY,
+                                      width: surface.width,
+                                      height: surface.height)
+            layer.renderingSurfaceOffset = surface.origin
+            layer.frame = CGRect(x: topDownFrame.minX,
+                                 y: contentHeight - topDownFrame.maxY,
+                                 width: topDownFrame.width,
+                                 height: topDownFrame.height)
+            return true
+        }
+
+        previewTextFragmentCoverage = (generation: previewTextContentGeneration,
+                                       textWidth: textWidth,
+                                       contentHeight: contentHeight,
+                                       rect: layoutRect)
+        let staleFragmentIDs = previewTextFragmentLayers.keys.filter { !visibleFragmentIDs.contains($0) }
+        for id in staleFragmentIDs {
+            previewTextFragmentLayers[id]?.removeFromSuperlayer()
+            previewTextFragmentLayers[id] = nil
+        }
+        updatePreviewTextSelectionLayers()
+    }
+
+    private func updatePreviewImageLayout(textWidth: CGFloat, contentHeight: CGFloat) {
+        guard previewImage != nil else {
+            previewImageLayer.isHidden = true
+            previewImageLayer.frame = .zero
+            previewImageCaptionLayer.isHidden = true
+            previewImageCaptionLayer.frame = .zero
+            return
+        }
+
+        let imageSize = previewImageDisplaySize(textWidth: textWidth)
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            previewImageLayer.isHidden = true
+            previewImageLayer.frame = .zero
+            previewImageCaptionLayer.isHidden = true
+            previewImageCaptionLayer.frame = .zero
+            return
+        }
+
+        let textHeight = previewTextOnlyHeight(textWidth: textWidth)
+        let imageTopY = textHeight > 1 ? textHeight + 14 : 0
+        previewImageLayer.isHidden = false
+        previewImageLayer.frame = CGRect(x: floor((textWidth - imageSize.width) / 2),
+                                         y: contentHeight - imageTopY - imageSize.height,
+                                         width: imageSize.width,
+                                         height: imageSize.height)
+        let captionHeight = previewImageCaptionHeight(textWidth: textWidth)
+        if captionHeight > 0 {
+            let captionTopY = imageTopY + imageSize.height + 8
+            previewImageCaptionLayer.isHidden = false
+            previewImageCaptionLayer.frame = CGRect(x: 0,
+                                                    y: contentHeight - captionTopY - captionHeight,
+                                                    width: textWidth,
+                                                    height: captionHeight)
+        } else {
+            previewImageCaptionLayer.isHidden = true
+            previewImageCaptionLayer.frame = .zero
+        }
+    }
+
+    private func previewImageEntry(at point: CGPoint) -> FileEntry? {
+        guard previewImage != nil,
+              !previewImageLayer.isHidden,
+              let selectedIndex,
+              entries.indices.contains(selectedIndex),
+              !entries[selectedIndex].isDirectory else {
+            return nil
+        }
+
+        let clipPoint = previewClipLayer.convert(point, from: rootLayer)
+        guard previewClipLayer.bounds.contains(clipPoint) else { return nil }
+
+        let contentPoint = previewTextContentLayer.convert(point, from: rootLayer)
+        guard previewImageLayer.frame.contains(contentPoint) else { return nil }
+        return entries[selectedIndex]
+    }
+
+    private func previewImageDragPreviewOrigin() -> CGPoint? {
+        guard previewImage != nil,
+              !previewImageLayer.isHidden else {
+            return nil
+        }
+        return previewTextContentLayer.convert(previewImageLayer.frame, to: rootLayer).origin
+    }
+
+    private func previewImageDragPreview() -> DragPreview? {
+        guard let image = previewImage,
+              !previewImageLayer.isHidden,
+              previewImageLayer.bounds.width > 0,
+              previewImageLayer.bounds.height > 0 else {
+            return nil
+        }
+
+        let displaySize = previewImageLayer.bounds.size
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data,
+                                                                 UTType.png.identifier as CFString,
+                                                                 1,
+                                                                 nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+        return DragPreview(pngData: data as Data, size: displaySize)
+    }
+
+    private func clearPreviewTextFragmentLayers() {
+        for layer in previewTextFragmentLayers.values {
+            layer.removeFromSuperlayer()
+        }
+        previewTextFragmentLayers = [:]
+        previewTextFragmentCoverage = nil
+    }
+
+    private func setPreviewTextSelectionRange(_ range: NSRange?) {
+        let nextRange = normalizedPreviewSelectionRange(range)
+        if nextRange == previewTextSelectionRange {
+            return
+        }
+        previewTextLayoutManager.textSelections = []
+        previewTextSelectionRange = nextRange
+        updatePreviewTextSelectionLayers(force: true)
+    }
+
+    private func setPreviewTextSelection(_ selection: NSTextSelection?) {
+        let nextRange = normalizedPreviewSelectionRange(previewTextRangeOffsets(for: selection))
+        if nextRange == previewTextSelectionRange {
+            return
+        }
+        previewTextLayoutManager.textSelections = selection.map { [$0] } ?? []
+        previewTextSelectionRange = nextRange
+        updatePreviewTextSelectionLayers(force: true)
+    }
+
+    private func normalizedPreviewSelectionRange(_ range: NSRange?) -> NSRange? {
+        guard let range else { return nil }
+        let lower = max(min(range.location, previewAttributedText.length), 0)
+        let upper = max(min(range.location + range.length, previewAttributedText.length), lower)
+        guard upper > lower else { return nil }
+        return NSRange(location: lower, length: upper - lower)
+    }
+
+    private func selectedPreviewAttributedText() -> NSAttributedString? {
+        guard let selectionRange = previewTextSelectionRange,
+              selectionRange.location >= 0,
+              selectionRange.location + selectionRange.length <= previewAttributedText.length else {
+            return nil
+        }
+        return previewAttributedText.attributedSubstring(from: selectionRange)
+    }
+
+    private func previewAttributedText(for selection: NSTextSelection?) -> NSAttributedString? {
+        guard let range = previewTextRangeOffsets(for: selection),
+              range.location >= 0,
+              range.location + range.length <= previewAttributedText.length else {
+            return nil
+        }
+        return previewAttributedText.attributedSubstring(from: range)
+    }
+
+    private func updatePreviewTextSelectionLayers(force: Bool = false) {
+        withoutImplicitAnimations {
+            updatePreviewTextSelectionLayersWithoutAnimations(force: force)
+        }
+    }
+
+    private func updatePreviewTextSelectionLayersWithoutAnimations(force: Bool) {
+        guard let selectionRange = previewTextSelectionRange,
+              selectionRange.length > 0 else {
+            clearPreviewTextSelectionLayers()
+            return
+        }
+
+        let textWidth = max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1)
+        let contentHeight = max(previewContentHeight() - previewTextInsetY * 2, previewClipLayer.bounds.height)
+        let visibleTextRect = visiblePreviewTextContentRect()
+        if !force,
+           let coverage = previewTextSelectionCoverage,
+           coverage.generation == previewTextContentGeneration,
+           abs(coverage.textWidth - textWidth) <= 0.5,
+           abs(coverage.contentHeight - contentHeight) <= 0.5,
+           coverage.range == selectionRange,
+           coverage.rect.contains(visibleTextRect) {
+            return
+        }
+
+        clearPreviewTextSelectionLayers()
+        let selectionColor = NSColor.selectedTextBackgroundColor.withAlphaComponent(0.78).cgColor
+        let selectionRect = expandedPreviewTextContentRect(containing: visibleTextRect,
+                                                           contentHeight: contentHeight)
+        for rect in previewTextSegmentRects(for: selectionRange, type: .selection) {
+            guard rect.intersects(selectionRect) else { continue }
+            let normalizedRect = CGRect(x: rect.minX,
+                                        y: rect.minY,
+                                        width: max(rect.width, 1),
+                                        height: max(rect.height, 1))
+            let highlight = CALayer()
+            highlight.frame = CGRect(x: normalizedRect.minX,
+                                     y: previewTextSelectionLayer.bounds.height - normalizedRect.maxY,
+                                     width: normalizedRect.width,
+                                     height: normalizedRect.height)
+            highlight.backgroundColor = selectionColor
+            highlight.cornerRadius = 2
+            previewTextSelectionLayer.addSublayer(highlight)
+            previewTextSelectionLayers.append(highlight)
+        }
+        previewTextSelectionCoverage = (generation: previewTextContentGeneration,
+                                        textWidth: textWidth,
+                                        contentHeight: contentHeight,
+                                        range: selectionRange,
+                                        rect: selectionRect)
+    }
+
+    private func clearPreviewTextSelectionLayers() {
+        for layer in previewTextSelectionLayers {
+            layer.removeFromSuperlayer()
+        }
+        previewTextSelectionLayers = []
+        previewTextSelectionCoverage = nil
+    }
+
+    private func previewTextRangeOffsets(for selection: NSTextSelection?) -> NSRange? {
+        guard let textRange = selection?.textRanges.first else { return nil }
+        let documentStart = previewTextLayoutManager.documentRange.location
+        let start = previewContentStorage.offset(from: documentStart, to: textRange.location)
+        let end = previewContentStorage.offset(from: documentStart, to: textRange.endLocation)
+        guard start != NSNotFound, end != NSNotFound else { return nil }
+        let location = max(0, min(start, end))
+        let length = min(previewAttributedText.length - location, abs(end - start))
+        guard length > 0 else { return nil }
+        return NSRange(location: location, length: length)
+    }
+
+    private func previewTextRange(for range: NSRange) -> NSTextRange? {
+        let documentStart = previewTextLayoutManager.documentRange.location
+        guard let start = previewContentStorage.location(documentStart, offsetBy: range.location),
+              let end = previewContentStorage.location(documentStart, offsetBy: range.location + range.length) else {
+            return nil
+        }
+        return NSTextRange(location: start, end: end)
+    }
+
+    private func previewTextLocation(for offset: Int) -> (any NSTextLocation)? {
+        previewContentStorage.location(previewTextLayoutManager.documentRange.location,
+                                       offsetBy: min(max(offset, 0), previewAttributedText.length))
+    }
+
+    private func previewTextOffset(for location: any NSTextLocation) -> Int {
+        min(max(previewContentStorage.offset(from: previewTextLayoutManager.documentRange.location, to: location), 0), previewAttributedText.length)
+    }
+
+    private func previewTextSegmentRects(for range: NSRange, type: NSTextLayoutManager.SegmentType) -> [CGRect] {
+        guard let textRange = previewTextRange(for: range) else { return [] }
+        previewTextLayoutManager.ensureLayout(for: textRange)
+        var rects: [CGRect] = []
+        previewTextLayoutManager.enumerateTextSegments(in: textRange, type: type, options: []) { _, rect, _, _ in
+            rects.append(rect)
+            return true
+        }
+        return rects
+    }
+
+    private func isPointInPreviewTextRegion(_ point: CGPoint) -> Bool {
+        guard !previewPaneLayer.isHidden else { return false }
+        let localPoint = previewClipLayer.convert(point, from: rootLayer)
+        return previewClipLayer.bounds.contains(localPoint)
+    }
+
+    private func isPointOverPreviewText(_ point: CGPoint) -> Bool {
+        guard isPointInPreviewTextRegion(point) else { return false }
+        let textPoint = previewTextContainerPoint(fromRootPoint: point)
+        let textWidth = max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1)
+        let textHeight = previewTextOnlyHeight(textWidth: textWidth)
+        return textPoint.x >= -1 &&
+               textPoint.x <= textWidth + 1 &&
+               textPoint.y >= -2 &&
+               textPoint.y <= min(textHeight, previewScrollOffset + previewClipLayer.bounds.height + 2)
+    }
+
+    private func previewTextContainerPoint(fromRootPoint point: CGPoint) -> CGPoint {
+        let localPoint = previewClipLayer.convert(point, from: rootLayer)
+        let topDownPoint = CGPoint(x: localPoint.x,
+                                   y: previewClipLayer.bounds.height - localPoint.y)
+        return CGPoint(x: topDownPoint.x - previewTextInsetX,
+                       y: topDownPoint.y + previewScrollOffset - previewTextInsetY)
+    }
+
+    private func previewTextInteractionBounds() -> CGRect {
+        let textWidth = max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1)
+        return CGRect(x: 0,
+                      y: 0,
+                      width: previewTextContainer.size.width,
+                      height: previewTextOnlyHeight(textWidth: textWidth))
+    }
+
+    private func previewTextOffset(atTextPoint textPoint: CGPoint) -> Int {
+        let point = CGPoint(x: max(textPoint.x, 0), y: max(textPoint.y, 0))
+        previewTextLayoutManager.ensureLayout(for: previewTextLayoutManager.documentRange)
+        guard let fragment = previewTextLayoutManager.textLayoutFragment(for: point) else {
+            return point.y <= 0 ? 0 : previewAttributedText.length
+        }
+        let fragmentFrame = fragment.layoutFragmentFrame
+        let localY = point.y - fragmentFrame.minY
+        guard let line = fragment.textLineFragment(forVerticalOffset: localY, requiresExactMatch: false) else {
+            return previewTextOffset(for: fragment.rangeInElement.location)
+        }
+
+        let fragmentStart = previewTextOffset(for: fragment.rangeInElement.location)
+        let linePoint = CGPoint(x: point.x - fragmentFrame.minX - line.typographicBounds.minX,
+                                y: localY - line.typographicBounds.minY)
+        let localIndex = line.characterIndex(for: linePoint)
+        let lineLower = line.characterRange.location
+        let lineUpper = line.characterRange.location + line.characterRange.length
+        let clampedLocalIndex = min(max(localIndex, lineLower), lineUpper)
+        return min(max(fragmentStart + clampedLocalIndex, 0), previewAttributedText.length)
+    }
+
+    private func previewTextSelection(at point: CGPoint) -> NSTextSelection? {
+        let textPoint = previewTextContainerPoint(fromRootPoint: point)
+        return previewTextLayoutManager.textSelectionNavigation.textSelections(interactingAt: textPoint,
+                                                                               inContainerAt: previewTextLayoutManager.documentRange.location,
+                                                                               anchors: [],
+                                                                               modifiers: [],
+                                                                               selecting: false,
+                                                                               bounds: previewTextInteractionBounds()).first
+    }
+
+    private func previewTextLayoutFragmentSelection(at textPoint: CGPoint) -> NSTextSelection? {
+        var matchingFragment: NSTextLayoutFragment?
+        previewTextLayoutManager.enumerateTextLayoutFragments(from: previewTextLayoutManager.documentRange.location,
+                                                              options: [.ensuresLayout]) { fragment in
+            let frame = fragment.layoutFragmentFrame
+            if frame.minY > textPoint.y {
+                return false
+            }
+            let paragraphHitFrame = CGRect(x: 0,
+                                           y: frame.minY,
+                                           width: previewTextContainer.size.width,
+                                           height: max(frame.height, 1))
+            if paragraphHitFrame.insetBy(dx: 0, dy: -2).contains(textPoint) {
+                matchingFragment = fragment
+                return false
+            }
+            return true
+        }
+
+        guard let range = matchingFragment?.rangeInElement else { return nil }
+        return NSTextSelection([range], affinity: .downstream, granularity: .paragraph)
+    }
+
+    private func previewTextLocationOffset(at point: CGPoint) -> Int? {
+        guard isPointOverPreviewText(point) else { return nil }
+        return previewTextOffset(atTextPoint: previewTextContainerPoint(fromRootPoint: point))
+    }
+
+    private func updateCursor(at point: CGPoint) {
+        if isPointOverPreviewText(point) {
+            setCursorIfNeeded(.iBeam)
+        } else {
+            setCursorIfNeeded(.arrow)
+        }
+    }
+
+    private func setCursorIfNeeded(_ cursor: PluginCursorType) {
+        guard currentCursor != cursor else { return }
+        currentCursor = cursor
+        outerframeHost.setCursor(cursor)
+    }
+
+    @discardableResult
+    private func handlePreviewMouseDown(at point: CGPoint,
+                                        modifierFlags: NSEvent.ModifierFlags,
+                                        clickCount: Int) -> Bool {
+        guard isPointInPreviewTextRegion(point) else { return false }
+        guard isPointOverPreviewText(point) else {
+            setPreviewTextSelectionRange(nil)
+            return true
+        }
+        let textPoint = previewTextContainerPoint(fromRootPoint: point)
+        let anchorOffset = previewTextOffset(atTextPoint: textPoint)
+        previewDragAnchorOffset = anchorOffset
+        lastPreviewDragTextPoint = nil
+
+        if clickCount >= 3 {
+            setPreviewTextSelection(previewTextLayoutFragmentSelection(at: textPoint))
+        } else if clickCount == 2, let selection = previewTextSelection(at: point) {
+            let wordSelection = previewTextLayoutManager.textSelectionNavigation.textSelection(for: .word,
+                                                                                              enclosing: selection)
+            setPreviewTextSelection(wordSelection)
+        } else if !modifierFlags.contains(.shift) {
+            setPreviewTextSelectionRange(nil)
+        }
+        return true
+    }
+
+    @discardableResult
+    private func handlePreviewRightMouseDown(at point: CGPoint) -> Bool {
+        guard isPointInPreviewTextRegion(point) else { return false }
+        guard isPointOverPreviewText(point) else { return true }
+
+        if let location = previewTextLocationOffset(at: point),
+           let selectionRange = previewTextSelectionRange,
+           NSLocationInRange(location, selectionRange),
+           let selectedText = selectedPreviewAttributedText() {
+            outerframeHost.showContextMenu(for: selectedText, at: point)
+            return true
+        }
+
+        guard let selection = previewTextSelection(at: point) else { return true }
+        let wordSelection = previewTextLayoutManager.textSelectionNavigation.textSelection(for: .word,
+                                                                                          enclosing: selection)
+        guard let selectedText = previewAttributedText(for: wordSelection),
+              !selectedText.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return true
+        }
+
+        setPreviewTextSelection(wordSelection)
+        outerframeHost.showContextMenu(for: selectedText, at: point)
+        return true
+    }
+
+    private func handlePreviewMouseDragged(to point: CGPoint) -> Bool {
+        guard let previewDragAnchorOffset else { return false }
+        let textPoint = previewTextContainerPoint(fromRootPoint: point)
+        if let lastPreviewDragTextPoint,
+           abs(lastPreviewDragTextPoint.x - textPoint.x) < 0.5,
+           abs(lastPreviewDragTextPoint.y - textPoint.y) < 0.5 {
+            return true
+        }
+        lastPreviewDragTextPoint = textPoint
+        let offset = previewTextOffset(atTextPoint: textPoint)
+        let location = min(previewDragAnchorOffset, offset)
+        let length = abs(offset - previewDragAnchorOffset)
+        setPreviewTextSelectionRange(NSRange(location: location, length: length))
+        return true
+    }
+
+    private func visiblePreviewTextContentRect() -> CGRect {
+        CGRect(x: 0,
+               y: max(previewScrollOffset - previewTextInsetY, 0),
+               width: max(previewClipLayer.bounds.width - previewTextInsetX * 2, 1),
+               height: previewClipLayer.bounds.height)
+    }
+
+    private func expandedPreviewTextContentRect(containing rect: CGRect, contentHeight: CGFloat) -> CGRect {
+        let overscan = max(previewClipLayer.bounds.height * 1.5, 500)
+        let minY = max(rect.minY - overscan, 0)
+        let maxY = min(max(rect.maxY + overscan, minY + rect.height), contentHeight)
+        return CGRect(x: rect.minX,
+                      y: minY,
+                      width: rect.width,
+                      height: max(maxY - minY, rect.height))
+    }
+
+    fileprivate func setPreviewScroll(_ value: CGFloat) {
+        let clamped = clampedPreviewScroll(value)
+        guard abs(clamped - previewScrollOffset) > 0.001 else {
+            updatePreviewScrollbarLayout()
+            return
+        }
+        previewScrollOffset = clamped
+        updatePreviewTextViewport()
+    }
+
+    private func clampedPreviewScroll(_ value: CGFloat) -> CGFloat {
+        let maxOffset = max(previewContentHeight() - previewClipLayer.bounds.height, 0)
+        return min(max(value, 0), maxOffset)
+    }
+
+    private func previewScrollbarMetrics() -> ScrollbarController<FilesPreviewScrollbarDelegate>.Metrics {
+        ScrollbarController.Metrics(viewportSize: previewClipLayer.bounds.size,
+                                    contentHeight: previewContentHeight(),
+                                    scrollOffset: previewScrollOffset)
+    }
+
+    private func updatePreviewScrollbarLayout() {
+        previewScrollbarController?.updateLayout(metrics: previewScrollbarMetrics())
     }
 
     private func updateFavoritesBar() {
@@ -797,6 +1716,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     self.parentPath = response.parent
                     self.entries = response.entries
                     self.selectedIndex = nil
+                    self.clearPreviewPane()
                     self.resetTypeahead()
                     self.dragCandidateIndex = nil
                     self.dragStartPoint = nil
@@ -821,6 +1741,333 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 }
             }
         }.resume()
+    }
+
+    private func selectedFileEntry() -> FileEntry? {
+        guard let selectedIndex,
+              entries.indices.contains(selectedIndex) else {
+            return nil
+        }
+        return entries[selectedIndex]
+    }
+
+    private func selectionDidChange() {
+        updatePreviewForSelection()
+    }
+
+    private func updatePreviewForSelection() {
+        guard let entry = selectedFileEntry() else {
+            showCurrentFolderInfo()
+            return
+        }
+
+        if entry.isDirectory {
+            showInfo(for: entry, additionalText: nil)
+            return
+        }
+
+        let generation = previewRequestGeneration + 1
+        previewRequestGeneration = generation
+        previewPath = entry.path
+        previewEntryName = entry.name
+        previewBodyText = ""
+        previewMessage = ""
+        previewIsLoading = false
+        setPreviewImage(nil)
+        previewScrollOffset = 0
+        updateLayout()
+        if previewKind(for: entry) == .media {
+            previewIsLoading = true
+            showLoadingPreviewIfStillPending(entry: entry, generation: generation)
+            fetchPreview(for: entry, generation: generation, preferredKind: .media)
+            return
+        }
+
+        fetchOpeners(for: entry) { [weak self] result in
+            guard let self,
+                  self.previewRequestGeneration == generation,
+                  self.selectedFileEntry()?.path == entry.path else {
+                return
+            }
+
+            guard case .success(let openers) = result,
+                  openers.contains(where: self.isPlaintextOpener) else {
+                self.showInfo(for: entry, additionalText: nil, preservingGeneration: true)
+                return
+            }
+
+            self.previewIsLoading = true
+            self.showLoadingPreviewIfStillPending(entry: entry, generation: generation)
+            self.fetchPreview(for: entry, generation: generation, preferredKind: .text)
+        }
+    }
+
+    private func clearPreviewPane(preservingGeneration: Bool = false) {
+        showCurrentFolderInfo(preservingGeneration: preservingGeneration)
+    }
+
+    private func showCurrentFolderInfo(preservingGeneration: Bool = false) {
+        if !preservingGeneration {
+            previewRequestGeneration += 1
+        }
+        previewPath = currentPath
+        let title = currentPath == "/" ? "/" : URL(fileURLWithPath: currentPath).lastPathComponent
+        previewEntryName = title.isEmpty ? "Folder" : title
+        previewBodyText = ""
+        previewMessage = ""
+        previewIsLoading = false
+        setPreviewImage(nil)
+        previewScrollOffset = 0
+        updatePreviewTextContentIfNeeded(force: true)
+        updateLayout()
+    }
+
+    private func showInfo(for entry: FileEntry,
+                          additionalText: String?,
+                          preservingGeneration: Bool = false) {
+        if !preservingGeneration {
+            previewRequestGeneration += 1
+        }
+        previewPath = entry.path
+        previewEntryName = entry.name
+        previewBodyText = additionalText ?? ""
+        previewMessage = ""
+        previewIsLoading = false
+        setPreviewImage(nil)
+        previewScrollOffset = 0
+        updatePreviewTextContentIfNeeded(force: true)
+        updateLayout()
+    }
+
+    private func currentFolderInfoText() -> String {
+        let folderCount = entries.filter(\.isDirectory).count
+        let fileCount = entries.count - folderCount
+        let itemLine = "\(entries.count) item\(entries.count == 1 ? "" : "s") (\(folderCount) folder\(folderCount == 1 ? "" : "s"), \(fileCount) file\(fileCount == 1 ? "" : "s"))"
+        return [
+            "Folder",
+            "Path: \(currentPath)",
+            itemLine
+        ].joined(separator: "\n")
+    }
+
+    private func infoText(for entry: FileEntry) -> String {
+        var lines: [String] = []
+        lines.append(entry.isDirectory ? "Folder" : "File")
+        lines.append("Path: \(entry.path)")
+        if !entry.isDirectory {
+            lines.append("Size: \(formatByteCount(entry.size))")
+        }
+        lines.append("Modified: \(formatModified(entry.modified))")
+        lines.append("Permissions: \(entry.mode)")
+        if entry.userCanModify {
+            lines.append("Access: view and edit")
+        } else if entry.userCanView {
+            lines.append("Access: view")
+        } else {
+            lines.append("Access: restricted")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func showLoadingPreviewIfStillPending(entry: FileEntry, generation: Int) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard let self,
+                  self.previewRequestGeneration == generation,
+                  self.selectedFileEntry()?.path == entry.path,
+                  self.previewPath == entry.path,
+                  self.previewIsLoading,
+                  self.previewMessage.isEmpty else {
+                return
+            }
+            self.previewMessage = "Loading preview..."
+            self.renderPreviewPane()
+        }
+    }
+
+    private func isPlaintextOpener(_ opener: FileOpener) -> Bool {
+        opener.serviceID == "org.outershell.Plaintext" ||
+        opener.displayName.trimmingCharacters(in: .whitespacesAndNewlines) == "Plaintext"
+    }
+
+    private func previewKind(for entry: FileEntry) -> FilePreviewKind {
+        let ext = URL(fileURLWithPath: entry.name).pathExtension.lowercased()
+        if ["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "heic", "heif", "ico", "icns", "pdf", "svg", "svgz"].contains(ext) {
+            return .media
+        }
+        if let type = UTType(filenameExtension: ext),
+           type.conforms(to: .image) || type.conforms(to: .pdf) {
+            return .media
+        }
+        return .text
+    }
+
+    private func fetchPreview(for entry: FileEntry, generation: Int, preferredKind: FilePreviewKind) {
+        guard let previewEndpoint,
+              let urlSession else {
+            previewIsLoading = false
+            previewMessage = "Preview unavailable."
+            renderPreviewPane()
+            return
+        }
+        guard let request = Self.binaryPathRequest(url: previewEndpoint,
+                                                   magic: FilePathRequestBinaryFormat.magic,
+                                                   path: entry.path) else {
+            previewIsLoading = false
+            previewMessage = "Could not build preview request."
+            renderPreviewPane()
+            return
+        }
+
+        urlSession.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self,
+                      self.previewRequestGeneration == generation,
+                      self.selectedFileEntry()?.path == entry.path else {
+                    return
+                }
+
+                self.previewIsLoading = false
+                if let error {
+                    self.previewBodyText = ""
+                    self.previewMessage = "Could not load preview: \(error.localizedDescription)"
+                    self.setPreviewImage(nil)
+                    self.previewScrollOffset = 0
+                    self.renderPreviewPane()
+                    return
+                }
+                if let httpResponse = response as? HTTPURLResponse,
+                   !(200..<300).contains(httpResponse.statusCode) {
+                    self.previewBodyText = ""
+                    self.previewMessage = "Could not load preview: \(Self.responseErrorMessage(data: data, fallback: "HTTP \(httpResponse.statusCode)"))"
+                    self.setPreviewImage(nil)
+                    self.previewScrollOffset = 0
+                    self.renderPreviewPane()
+                    return
+                }
+                guard let data else {
+                    self.previewBodyText = ""
+                    self.previewMessage = "Could not load preview."
+                    self.setPreviewImage(nil)
+                    self.previewScrollOffset = 0
+                    self.renderPreviewPane()
+                    return
+                }
+
+                let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+                if preferredKind == .media || Self.isMediaPreviewContentType(contentType) {
+                    if let imagePreview = Self.previewImage(from: data, contentType: contentType) {
+                        self.previewBodyText = ""
+                        self.previewMessage = ""
+                        self.setPreviewImage(imagePreview.image,
+                                             naturalSize: imagePreview.size,
+                                             captionText: Self.isSVGPreview(entry: entry, contentType: contentType) ? Self.svgPreviewWarning : "")
+                    } else {
+                        self.previewBodyText = ""
+                        self.previewMessage = "Could not decode image preview."
+                        self.setPreviewImage(nil)
+                    }
+                    self.previewScrollOffset = 0
+                    self.renderPreviewPane()
+                    return
+                }
+
+                guard let text = String(data: data, encoding: .utf8) else {
+                    self.previewBodyText = ""
+                    self.previewMessage = "Could not decode preview as UTF-8."
+                    self.setPreviewImage(nil)
+                    self.previewScrollOffset = 0
+                    self.renderPreviewPane()
+                    return
+                }
+
+                self.previewBodyText = text
+                self.previewMessage = text.isEmpty ? "Empty file." : ""
+                self.setPreviewImage(nil)
+                self.previewScrollOffset = 0
+                self.renderPreviewPane()
+            }
+        }.resume()
+    }
+
+    private static func isMediaPreviewContentType(_ contentType: String) -> Bool {
+        contentType.hasPrefix("image/") || contentType.hasPrefix("application/pdf")
+    }
+
+    private static let svgPreviewWarning = "This preview relies on macOS's low-level SVG rendering, which is often wrong. Drag this file to your computer and open it locally for better results."
+
+    private static func isSVGPreview(entry: FileEntry, contentType: String) -> Bool {
+        if contentType.hasPrefix("image/svg") { return true }
+        let ext = URL(fileURLWithPath: entry.name).pathExtension.lowercased()
+        return ext == "svg" || ext == "svgz"
+    }
+
+    private static func previewImage(from data: Data, contentType: String) -> (image: CGImage, size: CGSize)? {
+        if contentType.hasPrefix("application/pdf") || data.starts(with: Data("%PDF".utf8)) {
+            return previewPDFImage(from: data)
+        }
+
+        if let source = CGImageSourceCreateWithData(data as CFData, nil),
+           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+            let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue ?? Double(image.width)
+            let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue ?? Double(image.height)
+            return (image, CGSize(width: width, height: height))
+        }
+
+        guard let nsImage = NSImage(data: data),
+              let image = cgImage(from: nsImage) else {
+            return nil
+        }
+        let size = nsImage.size.width > 0 && nsImage.size.height > 0
+            ? nsImage.size
+            : CGSize(width: image.width, height: image.height)
+        return (image, size)
+    }
+
+    private static func cgImage(from image: NSImage) -> CGImage? {
+        var proposedRect = CGRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil)
+    }
+
+    private static func previewPDFImage(from data: Data) -> (image: CGImage, size: CGSize)? {
+        guard let provider = CGDataProvider(data: data as CFData),
+              let document = CGPDFDocument(provider),
+              let page = document.page(at: 1) else {
+            return nil
+        }
+
+        let pageRect = page.getBoxRect(.mediaBox)
+        guard pageRect.width > 0, pageRect.height > 0 else { return nil }
+
+        let maxPixelDimension: CGFloat = 1800
+        let scale = min(2, maxPixelDimension / max(pageRect.width, pageRect.height))
+        let pixelWidth = max(Int(ceil(pageRect.width * scale)), 1)
+        let pixelHeight = max(Int(ceil(pageRect.height * scale)), 1)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let context = CGContext(data: nil,
+                                      width: pixelWidth,
+                                      height: pixelHeight,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: 0,
+                                      space: colorSpace,
+                                      bitmapInfo: bitmapInfo) else {
+            return nil
+        }
+
+        context.setFillColor(NSColor.textBackgroundColor.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        context.scaleBy(x: scale, y: scale)
+        let targetRect = CGRect(origin: .zero, size: pageRect.size)
+        context.concatenate(page.getDrawingTransform(.mediaBox,
+                                                     rect: targetRect,
+                                                     rotate: 0,
+                                                     preserveAspectRatio: true))
+        context.drawPDFPage(page)
+
+        guard let image = context.makeImage() else { return nil }
+        return (image, pageRect.size)
     }
 
     private func updateRows(rebuild: Bool = true) {
@@ -1025,14 +2272,19 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         rowsScrollbarController?.updateLayout(metrics: rowsScrollbarMetrics())
     }
 
-    private func handleMouseDown(at point: CGPoint, clickCount: Int) {
+    private func handleMouseDown(at point: CGPoint,
+                                 modifierFlags: NSEvent.ModifierFlags,
+                                 clickCount: Int) {
         dragCandidateIndex = nil
         dragStartPoint = nil
         dragStartedForSelectionIndex = nil
+        previewImageDragCandidateEntry = nil
+        previewImageDragStartPoint = nil
         isDraggingFolderToFavorites = false
 
         if let favoritePath = favoritePath(at: point) {
             selectedIndex = nil
+            selectionDidChange()
             resetTypeahead()
             updateRows()
             updatePasteboardCapabilities()
@@ -1043,6 +2295,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         if let breadcrumbPath = breadcrumbPath(at: point) {
             selectedIndex = nil
+            selectionDidChange()
             resetTypeahead()
             updateRows()
             updatePasteboardCapabilities()
@@ -1056,9 +2309,25 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
+        if previewPaneLayer.frame.contains(point) {
+            let previewPoint = previewClipLayer.convert(point, from: rootLayer)
+            if previewScrollbarController?.handleMouseDown(at: previewPoint) == true {
+                return
+            }
+            if let entry = previewImageEntry(at: point) {
+                previewImageDragCandidateEntry = entry
+                previewImageDragStartPoint = point
+                setPreviewTextSelectionRange(nil)
+                return
+            }
+            _ = handlePreviewMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
+            return
+        }
+
         let index = rowIndex(at: point)
         guard index >= 0, index < entries.count else {
             selectedIndex = nil
+            selectionDidChange()
             resetTypeahead()
             updateRows()
             updatePasteboardCapabilities()
@@ -1067,6 +2336,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         selectedIndex = index
+        selectionDidChange()
         resetTypeahead()
         dragCandidateIndex = index
         dragStartPoint = point
@@ -1087,6 +2357,26 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags _: NSEvent.ModifierFlags) {
+        if let entry = previewImageDragCandidateEntry,
+           let startPoint = previewImageDragStartPoint {
+            guard hypot(point.x - startPoint.x, point.y - startPoint.y) >= 4 else {
+                return
+            }
+            previewImageDragCandidateEntry = nil
+            previewImageDragStartPoint = nil
+            beginDraggingFilePromise(for: entry,
+                                     preview: previewImageDragPreview(),
+                                     previewFrameOrigin: previewImageDragPreviewOrigin())
+            return
+        }
+
+        if previewPaneLayer.frame.contains(point),
+           previewScrollbarController?.handleMouseDragged(to: previewClipLayer.convert(point, from: rootLayer)) == true {
+            return
+        }
+        if handlePreviewMouseDragged(to: point) {
+            return
+        }
         if rowsScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: rowsClipLayer)) == true {
             return
         }
@@ -1123,6 +2413,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseUp(at point: CGPoint) {
+        _ = previewScrollbarController?.handleMouseUp(at: previewClipLayer.convert(point, from: rootLayer))
+        previewDragAnchorOffset = nil
+        lastPreviewDragTextPoint = nil
+        previewImageDragCandidateEntry = nil
+        previewImageDragStartPoint = nil
         _ = rowsScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: rowsClipLayer))
         defer {
             dragCandidateIndex = nil
@@ -1178,6 +2473,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         guard !entries.isEmpty else { return }
         let nextIndex = min(max((selectedIndex ?? (delta > 0 ? -1 : entries.count)) + delta, 0), entries.count - 1)
         selectedIndex = nextIndex
+        selectionDidChange()
         let rowTop = CGFloat(nextIndex) * rowHeight
         let viewportHeight = rowsClipLayer.bounds.height
         if rowTop < scrollOffset {
@@ -1193,6 +2489,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func selectIndex(_ index: Int) {
         guard entries.indices.contains(index) else { return }
         selectedIndex = index
+        selectionDidChange()
         ensureSelectionVisible()
         updateRows()
         updatePasteboardCapabilities()
@@ -1274,7 +2571,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
         var enabledCommands: OuterframeEditCommandSet = []
-        if requestedCommands.contains(.copy), selectedFileEntryForCopy() != nil {
+        if requestedCommands.contains(.copy),
+           selectedPreviewAttributedText() != nil || selectedFileEntryForCopy() != nil {
             enabledCommands.insert(.copy)
         }
         if requestedCommands.contains(.paste) {
@@ -1291,6 +2589,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleSelectionToPasteboardCopyRequest(requestID: UUID) {
+        if let selectedText = selectedPreviewAttributedText() {
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                             items: pasteboardItems(for: selectedText))
+            return
+        }
+
         guard let entry = selectedFileEntryForCopy(),
               let downloadEndpoint,
               let urlSession,
@@ -1338,6 +2642,19 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
+    private func pasteboardItems(for selectedText: NSAttributedString) -> [OuterframeContentPasteboardItem] {
+        var representations = [
+            OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                      data: Data(selectedText.string.utf8))
+        ]
+        if let rtfData = try? selectedText.data(from: NSRange(location: 0, length: selectedText.length),
+                                                documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+            representations.append(OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.rtf.rawValue,
+                                                                             data: rtfData))
+        }
+        return [OuterframeContentPasteboardItem(representations: representations)]
+    }
+
     private func contextMenuSeparator(id: String) -> OuterframeContextMenuItem {
         OuterframeContextMenuItem(id: id,
                                   title: "",
@@ -1346,10 +2663,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleRightMouseDown(at point: CGPoint) {
+        if previewPaneLayer.frame.contains(point) {
+            _ = handlePreviewRightMouseDown(at: point)
+            return
+        }
+
         let index = rowIndex(at: point)
         if entries.indices.contains(index), entries[index].isDirectory {
             let entry = entries[index]
             selectedIndex = index
+            selectionDidChange()
             updateRows()
             updatePasteboardCapabilities()
 
@@ -1378,6 +2701,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         if entries.indices.contains(index) {
             selectedIndex = index
+            selectionDidChange()
             updateRows()
             updatePasteboardCapabilities()
             let entry = entries[index]
@@ -1820,6 +3144,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func beginDraggingFilePromise(for entry: FileEntry, at index: Int) {
+        dragStartedForSelectionIndex = index
+        beginDraggingFilePromise(for: entry,
+                                 preview: dragPreview(for: entry),
+                                 previewFrameOrigin: dragPreviewOrigin(forRowAt: index))
+    }
+
+    private func beginDraggingFilePromise(for entry: FileEntry,
+                                          preview dragPreview: DragPreview?,
+                                          previewFrameOrigin: CGPoint?) {
         guard outerframeHost.stagedFileDirectoryURL != nil else {
             dragStartedForSelectionIndex = nil
             statusLayer.string = "Could not prepare drag"
@@ -1829,7 +3162,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         let promiseID = UUID()
         filePromiseEntries[promiseID] = entry
-        let dragPreview = dragPreview(for: entry)
         guard let pasteboardItem = outerframeHost.filePromisePasteboardItem(promiseID: promiseID,
                                                                             name: entry.name,
                                                                             fileSize: entry.isDirectory ? nil : entry.size,
@@ -1843,7 +3175,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                    operationMask: .copy,
                                                    previewPNGData: dragPreview?.pngData,
                                                    previewSize: dragPreview?.size,
-                                                   previewFrameOrigin: dragPreviewOrigin(forRowAt: index))
+                                                   previewFrameOrigin: previewFrameOrigin)
     }
 
     private func handleFilePromiseWriteRequest(requestID: UUID, promiseID: UUID) {
@@ -2506,6 +3838,14 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                           label: "Size"))
         children.append(buildFileTableAccessibilityNode(nextIdentifier: &nextIdentifier))
 
+        if !previewPaneLayer.isHidden {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                             role: .staticText,
+                                             frame: previewPaneLayer.frame,
+                                             label: previewEntryName.isEmpty ? "File preview" : "Preview of \(previewEntryName)",
+                                             value: previewMessage.isEmpty ? previewBodyText : previewMessage))
+        }
+
         if let status = statusLayer.string as? String, !status.isEmpty {
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                              role: .staticText,
@@ -2645,6 +3985,18 @@ private func withoutImplicitAnimations(_ body: () -> Void) {
     CATransaction.commit()
 }
 
+private func disableImplicitActions(for layer: CALayer) {
+    layer.actions = [
+        "bounds": NSNull(),
+        "contents": NSNull(),
+        "hidden": NSNull(),
+        "opacity": NSNull(),
+        "position": NSNull(),
+        "sublayers": NSNull(),
+        "transform": NSNull()
+    ]
+}
+
 @MainActor
 private final class FilesRowsScrollbarDelegate: ScrollbarControllerDelegate {
     private weak var owner: FilesHandler?
@@ -2655,5 +4007,18 @@ private final class FilesRowsScrollbarDelegate: ScrollbarControllerDelegate {
 
     func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
         owner?.setRowsScroll(offset)
+    }
+}
+
+@MainActor
+private final class FilesPreviewScrollbarDelegate: ScrollbarControllerDelegate {
+    private weak var owner: FilesHandler?
+
+    init(owner: FilesHandler) {
+        self.owner = owner
+    }
+
+    func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        owner?.setPreviewScroll(offset)
     }
 }
