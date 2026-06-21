@@ -82,6 +82,7 @@ private enum FileOpenersFetchResult {
 }
 
 private enum FilePreviewKind {
+    case none
     case text
     case media
 }
@@ -1838,30 +1839,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         setPreviewImage(nil)
         previewScrollOffset = 0
         updateLayout()
-        if previewKind(for: entry) == .media {
+        let kind = previewKind(for: entry)
+        if kind == .none {
+            showInfo(for: entry, additionalText: nil, preservingGeneration: true)
+            return
+        }
+        if kind == .media {
             previewIsLoading = true
             showLoadingPreviewIfStillPending(entry: entry, generation: generation)
             fetchPreview(for: entry, generation: generation, preferredKind: .media)
             return
         }
 
-        fetchOpeners(for: entry) { [weak self] result in
-            guard let self,
-                  self.previewRequestGeneration == generation,
-                  self.selectedFileEntry()?.path == entry.path else {
-                return
-            }
-
-            guard case .success(let openers) = result,
-                  openers.contains(where: self.isPlaintextOpener) else {
-                self.showInfo(for: entry, additionalText: nil, preservingGeneration: true)
-                return
-            }
-
-            self.previewIsLoading = true
-            self.showLoadingPreviewIfStillPending(entry: entry, generation: generation)
-            self.fetchPreview(for: entry, generation: generation, preferredKind: .text)
-        }
+        previewIsLoading = true
+        showLoadingPreviewIfStillPending(entry: entry, generation: generation)
+        fetchPreview(for: entry, generation: generation, preferredKind: .text)
     }
 
     private func clearPreviewPane(preservingGeneration: Bool = false) {
@@ -1947,12 +1939,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
-    private func isPlaintextOpener(_ opener: FileOpener) -> Bool {
-        opener.serviceID == "org.outershell.Plaintext" ||
-        opener.displayName.trimmingCharacters(in: .whitespacesAndNewlines) == "Plaintext"
-    }
-
     private func previewKind(for entry: FileEntry) -> FilePreviewKind {
+        guard !entry.isDirectory else {
+            return .none
+        }
         let ext = URL(fileURLWithPath: entry.name).pathExtension.lowercased()
         if ["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "heic", "heif", "ico", "icns", "pdf", "svg", "svgz"].contains(ext) {
             return .media
@@ -1961,7 +1951,30 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
            type.conforms(to: .image) || type.conforms(to: .pdf) {
             return .media
         }
-        return .text
+        if isTextPreviewCandidate(entry: entry, fileExtension: ext) {
+            return .text
+        }
+        return .none
+    }
+
+    private func isTextPreviewCandidate(entry: FileEntry, fileExtension ext: String) -> Bool {
+        if !ext.isEmpty {
+            if Self.textPreviewExtensions.contains(ext) {
+                return true
+            }
+            if let type = UTType(filenameExtension: ext),
+               type.conforms(to: .text) {
+                return true
+            }
+            return false
+        }
+
+        let name = entry.name.lowercased()
+        if Self.textPreviewFileNames.contains(name) {
+            return true
+        }
+
+        return entry.userCanView && !entry.isExecutableFile
     }
 
     private func fetchPreview(for entry: FileEntry, generation: Int, preferredKind: FilePreviewKind) {
@@ -2055,6 +2068,20 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private static func isMediaPreviewContentType(_ contentType: String) -> Bool {
         contentType.hasPrefix("image/") || contentType.hasPrefix("application/pdf")
     }
+
+    private static let textPreviewExtensions: Set<String> = [
+        "awk", "bash", "c", "cc", "cfg", "conf", "cpp", "cs", "css", "csv", "cxx",
+        "diff", "env", "go", "h", "hpp", "htm", "html", "ini", "java", "js", "json",
+        "jsx", "log", "lua", "m", "make", "markdown", "md", "mm", "patch", "php",
+        "pl", "plist", "properties", "py", "rb", "rs", "rtf", "scpt", "sh", "sql",
+        "swift", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml", "zsh"
+    ]
+
+    private static let textPreviewFileNames: Set<String> = [
+        ".bash_profile", ".bashrc", ".gitconfig", ".gitignore", ".profile", ".ssh_config",
+        ".zprofile", ".zshrc", "authorized_keys", "config", "hosts", "makefile",
+        "readme", "version"
+    ]
 
     private static let svgPreviewWarning = "This preview relies on macOS's low-level SVG rendering, which is often wrong. Drag this file to your computer and open it locally for better results."
 
