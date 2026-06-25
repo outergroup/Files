@@ -28,6 +28,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
+#endif
+
 #define DEFAULT_PORT 7354
 #define READ_BUFFER_SIZE 8192
 #define FILE_TEXT_PREVIEW_MAX_BYTES (256 * 1024)
@@ -46,8 +51,60 @@ static char g_outershelld_api_socket_path[PATH_MAX] = "";
 static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
+static bool g_listen_socket_is_launchd_owned = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
+
+#ifdef __APPLE__
+static bool remove_last_path_component(char *path) {
+    char *slash = strrchr(path, '/');
+    if (!slash) return false;
+    if (slash == path) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return true;
+}
+
+static void configure_resource_paths_from_app_bundle(void) {
+    char executable_path[PATH_MAX];
+    uint32_t executable_path_size = sizeof(executable_path);
+    if (_NSGetExecutablePath(executable_path, &executable_path_size) != 0) {
+        return;
+    }
+
+    char resolved_path[PATH_MAX];
+    const char *path = realpath(executable_path, resolved_path) ? resolved_path : executable_path;
+    char macos_dir[PATH_MAX];
+    snprintf(macos_dir, sizeof(macos_dir), "%s", path);
+    if (!remove_last_path_component(macos_dir)) return;
+
+    char contents_dir[PATH_MAX];
+    snprintf(contents_dir, sizeof(contents_dir), "%s", macos_dir);
+    if (!remove_last_path_component(contents_dir)) return;
+
+    char arm_bundle_path[PATH_MAX];
+    char x86_bundle_path[PATH_MAX];
+    snprintf(arm_bundle_path, sizeof(arm_bundle_path),
+             "%s/Resources/bundles/FilesContent.bundle.macos-arm.aar", contents_dir);
+    snprintf(x86_bundle_path, sizeof(x86_bundle_path),
+             "%s/Resources/bundles/FilesContent.bundle.macos-x86.aar", contents_dir);
+
+    struct stat st;
+    if (stat(arm_bundle_path, &st) == 0 && S_ISREG(st.st_mode) &&
+        stat(x86_bundle_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm), "%s", arm_bundle_path);
+        snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86), "%s", x86_bundle_path);
+    }
+
+    char icon_path[PATH_MAX];
+    snprintf(icon_path, sizeof(icon_path), "%s/Resources/app-icon.png", contents_dir);
+    if (stat(icon_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        snprintf(g_app_icon_path, sizeof(g_app_icon_path), "%s", icon_path);
+    }
+}
+#endif
 
 typedef struct {
     char *data;
@@ -364,12 +421,13 @@ enum {
 };
 
 enum {
-    OUTERSHELLD_API_OUTERCTL_INVOKE = 1,
-    OUTERSHELLD_API_OUTERCTL_INVOKE_RESPONSE = 2,
-    OUTERSHELLD_API_FILE_OPENERS_QUERY = 3,
-    OUTERSHELLD_API_FILE_OPENERS_RESPONSE = 4,
+    OUTERSHELLD_API_APP_ADD_REQUEST = 13,
+    OUTERSHELLD_API_APP_REMOVE_REQUEST = 14,
+    OUTERSHELLD_API_FILE_OPENERS_QUERY = 31,
+    OUTERSHELLD_API_COMMAND_RESPONSE = 100,
+    OUTERSHELLD_API_FILE_OPENERS_RESPONSE = 107,
     OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE = 18,
-    OUTERSHELLD_API_MAX_FRAME_SIZE = 1024 * 1024
+    OUTERSHELLD_API_MAX_FRAME_SIZE = 16 * 1024 * 1024
 };
 
 static uint32_t read_u32_le_from_bytes(const unsigned char *data, size_t offset) {
@@ -483,6 +541,10 @@ static void default_outershelld_api_socket_path(char *out, size_t out_size) {
         return;
     }
 #ifdef __APPLE__
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/var/run/outershelld-api");
+        return;
+    }
     const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
     if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
     if (tmp && tmp[0]) {
@@ -491,6 +553,10 @@ static void default_outershelld_api_socket_path(char *out, size_t out_size) {
     }
     snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
 #else
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/run/outershelld-api");
+        return;
+    }
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0]) {
         snprintf(out, out_size, "%s/outershelld-api", runtime);
@@ -584,26 +650,45 @@ static bool send_outershelld_api_message(StringBuilder *message, StringBuilder *
     return ok;
 }
 
-static bool send_outerctl_invoke_to_outershelld(const char *const *arguments, size_t argument_count) {
-    if (!arguments || argument_count > 256) return false;
-    size_t fixed_size = 14 + argument_count * 8;
-    StringBuilder message = {0};
+static bool send_outershelld_command_request(StringBuilder *message) {
     StringBuilder response = {0};
-    bool ok = sb_append_zero(&message, fixed_size) &&
-              (write_uint16_le((unsigned char *)message.data, OUTERSHELLD_API_OUTERCTL_INVOKE), true) &&
-              (write_u32_le_at(message.data, 2, (uint32_t)argument_count), true) &&
-              api_message_append_string_ref_at(&message, 6, "");
-    for (size_t i = 0; ok && i < argument_count; i++) {
-        ok = api_message_append_string_ref_at(&message, 14 + i * 8, arguments[i]);
-    }
-    ok = ok && send_outershelld_api_message(&message, &response);
+    bool ok = send_outershelld_api_message(message, &response);
     if (ok) {
         ok = response.length >= 6 &&
-             read_u16_le_from_bytes((const unsigned char *)response.data, 0) == OUTERSHELLD_API_OUTERCTL_INVOKE_RESPONSE &&
+             read_u16_le_from_bytes((const unsigned char *)response.data, 0) == OUTERSHELLD_API_COMMAND_RESPONSE &&
              read_u32_le_from_bytes((const unsigned char *)response.data, 2) == 0;
     }
-    free(message.data);
     free(response.data);
+    return ok;
+}
+
+static bool send_app_add_to_outershelld(int port, const char *socket_path) {
+    StringBuilder message = {0};
+    bool ok = sb_append_zero(&message, 62) &&
+              (write_uint16_le((unsigned char *)message.data, OUTERSHELLD_API_APP_ADD_REQUEST), true) &&
+              (write_u32_le_at(message.data, 2, (uint32_t)(port > 0 ? port : 0)), true) &&
+              api_message_append_string_ref_at(&message, 6, g_backend_label) &&
+              api_message_append_string_ref_at(&message, 14, "Files") &&
+              api_message_append_string_ref_at(&message, 22, "") &&
+              api_message_append_string_ref_at(&message, 30, "") &&
+              api_message_append_string_ref_at(&message, 38, g_app_icon_path) &&
+              api_message_append_string_ref_at(&message, 46, "") &&
+              api_message_append_string_ref_at(&message, 54, socket_path ? socket_path : "");
+    ok = ok && send_outershelld_command_request(&message);
+    free(message.data);
+    return ok;
+}
+
+static bool send_app_remove_to_outershelld(int port, const char *socket_path) {
+    StringBuilder message = {0};
+    bool ok = sb_append_zero(&message, 30) &&
+              (write_uint16_le((unsigned char *)message.data, OUTERSHELLD_API_APP_REMOVE_REQUEST), true) &&
+              (write_u32_le_at(message.data, 2, (uint32_t)(port > 0 ? port : 0)), true) &&
+              api_message_append_string_ref_at(&message, 6, g_backend_label) &&
+              api_message_append_string_ref_at(&message, 14, "") &&
+              api_message_append_string_ref_at(&message, 22, socket_path ? socket_path : "");
+    ok = ok && send_outershelld_command_request(&message);
+    free(message.data);
     return ok;
 }
 
@@ -879,40 +964,19 @@ static void default_socket_path(char *out, size_t out_size) {
 
 static void send_app_announcement_to_outershelld(const char *action, int port, const char *socket_path) {
     if (!g_outershelld_api_socket_path[0] || !g_backend_label[0]) return;
-
-    char port_buffer[16];
-    snprintf(port_buffer, sizeof(port_buffer), "%d", port);
-    const char *arguments[24];
-    size_t argument_count = 0;
-    arguments[argument_count++] = "outerctl";
-    arguments[argument_count++] = "app";
-    arguments[argument_count++] = action;
-    arguments[argument_count++] = "--backend";
-    arguments[argument_count++] = g_backend_label;
-    if (socket_path && socket_path[0]) {
-        arguments[argument_count++] = "--socket-path";
-        arguments[argument_count++] = socket_path;
-    } else if (port > 0) {
-        arguments[argument_count++] = "--port";
-        arguments[argument_count++] = port_buffer;
-    } else {
-        return;
-    }
     if (strcmp(action, "add") == 0) {
-        arguments[argument_count++] = "--name";
-        arguments[argument_count++] = "Files";
-        if (g_app_icon_path[0]) {
-            arguments[argument_count++] = "--icon-file";
-            arguments[argument_count++] = g_app_icon_path;
-        }
+        (void)send_app_add_to_outershelld(port, socket_path);
+    } else if (strcmp(action, "remove") == 0) {
+        (void)send_app_remove_to_outershelld(port, socket_path);
     }
-    send_outerctl_invoke_to_outershelld(arguments, argument_count);
 }
 
 static void cleanup_handler(void) {
     if (g_listen_socket_path[0] && !g_systemd_socket_activation) {
         send_app_announcement_to_outershelld("remove", 0, g_listen_socket_path);
-        unlink(g_listen_socket_path);
+        if (!g_listen_socket_is_launchd_owned) {
+            unlink(g_listen_socket_path);
+        }
     }
 }
 
@@ -1107,6 +1171,15 @@ static bool append_file_list_entry_row(StringBuilder *rows,
            sb_append_u64_le(rows, modified_millis);
 }
 
+static uint64_t stat_modified_millis(const struct stat *st) {
+    if (!st) return 0;
+#if defined(__APPLE__)
+    return (uint64_t)st->st_mtimespec.tv_sec * 1000u + (uint64_t)st->st_mtimespec.tv_nsec / 1000000u;
+#else
+    return (uint64_t)st->st_mtim.tv_sec * 1000u + (uint64_t)st->st_mtim.tv_nsec / 1000000u;
+#endif
+}
+
 static void send_files_response_for_path(int fd, const char *requested, const char *requester_user) {
     char path[PATH_MAX];
     resolve_requested_path(requested, path, sizeof(path));
@@ -1157,7 +1230,7 @@ static void send_files_response_for_path(int fd, const char *requested, const ch
         }
         file->is_directory = S_ISDIR(st.st_mode);
         file->size = (uint64_t)st.st_size;
-        file->modified = (double)st.st_mtime;
+        file->modified = (double)stat_modified_millis(&st) / 1000.0;
         file->mode = st.st_mode;
         file->access_flags = requester_access_flags_for_stat(&access_context, &st);
         count++;
@@ -1298,6 +1371,30 @@ static void send_preview_response_for_path(int fd, const char *requested) {
 
     send_response(fd, 200, "OK", content_type, buffer, offset);
     free(buffer);
+}
+
+static void send_preview_metadata_response_for_path(int fd, const char *requested) {
+    enum {
+        FILE_PREVIEW_METADATA_BINARY_MAGIC = 0x534d5046u,
+        FILE_PREVIEW_METADATA_BINARY_VERSION = 1u,
+        FILE_PREVIEW_METADATA_BINARY_SIZE = 24u
+    };
+
+    char path[PATH_MAX];
+    resolve_requested_path(requested, path, sizeof(path));
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        send_text_response(fd, 404, "file not found\n");
+        return;
+    }
+
+    unsigned char payload[FILE_PREVIEW_METADATA_BINARY_SIZE];
+    write_uint32_le(payload + 0, FILE_PREVIEW_METADATA_BINARY_MAGIC);
+    write_uint32_le(payload + 4, FILE_PREVIEW_METADATA_BINARY_VERSION);
+    write_uint64_le(payload + 8, (uint64_t)st.st_size);
+    write_uint64_le(payload + 16, stat_modified_millis(&st));
+    send_response(fd, 200, "OK", "application/octet-stream", payload, sizeof(payload));
 }
 
 static void send_download_response(int fd, const char *query) {
@@ -1532,6 +1629,17 @@ static void handle_http_request(int fd, char *request, unsigned char *body, size
             free(body);
             return;
         }
+        if (strcmp(target, "/api/preview-metadata") == 0) {
+            char requested[PATH_MAX];
+            if (!read_binary_path_request(body, content_length, FILE_PATH_REQUEST_BINARY_MAGIC, requested, sizeof(requested))) {
+                free(body);
+                send_text_response(fd, 400, "bad preview metadata request\n");
+                return;
+            }
+            send_preview_metadata_response_for_path(fd, requested);
+            free(body);
+            return;
+        }
         if (strcmp(target, "/api/mkdir") == 0) {
             char requested_directory[PATH_MAX];
             char name[NAME_MAX + 1];
@@ -1702,6 +1810,7 @@ static void run_server_loop(int listener) {
             break;
         }
 
+        size_t polled_client_count = client_count;
         if (poll_result > 0 && (poll_fds[0].revents & POLLIN)) {
             while (client_count < MAX_HTTP_CLIENTS) {
                 struct sockaddr_storage peer;
@@ -1722,7 +1831,7 @@ static void run_server_loop(int listener) {
             }
         }
 
-        for (size_t i = 0; i < client_count; i++) {
+        for (size_t i = 0; i < polled_client_count; i++) {
             HttpClient *client = &clients[i];
             short revents = poll_fds[i + 1].revents;
             if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -1854,16 +1963,54 @@ static int systemd_activated_listener(void) {
     return 3;
 }
 
+#ifdef __APPLE__
+static int create_launchd_unix_listener(const char *socket_name, const char *socket_path) {
+    int *fds = NULL;
+    size_t count = 0;
+    int result = launch_activate_socket(socket_name, &fds, &count);
+    if (result != 0) {
+        errno = result;
+        perror("launch_activate_socket");
+        return -1;
+    }
+    if (!fds || count == 0) {
+        fprintf(stderr, "launchd socket unavailable\n");
+        free(fds);
+        return -1;
+    }
+
+    int listen_fd = fds[0];
+    for (size_t i = 1; i < count; i++) {
+        close(fds[i]);
+    }
+    free(fds);
+
+    if (socket_path && socket_path[0]) {
+        snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
+    } else {
+        default_socket_path(g_listen_socket_path, sizeof(g_listen_socket_path));
+    }
+    g_listen_socket_is_launchd_owned = true;
+    return listen_fd;
+}
+#endif
+
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     bool use_port = false;
     char socket_path[PATH_MAX] = "";
-    const char *bundles_dir = "bundles";
+    const char *bundles_dir = NULL;
+#ifdef __APPLE__
+    char launchd_socket_name[128] = "";
+#endif
     default_outershelld_api_socket_path(g_outershelld_api_socket_path, sizeof(g_outershelld_api_socket_path));
+#ifdef __APPLE__
+    configure_resource_paths_from_app_bundle();
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -1873,6 +2020,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--socket-path") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], socket_path, sizeof(socket_path));
             use_port = false;
+#ifdef __APPLE__
+        } else if (strcmp(argv[i], "--launchd-socket-name") == 0 && i + 1 < argc) {
+            snprintf(launchd_socket_name, sizeof(launchd_socket_name), "%s", argv[++i]);
+            use_port = false;
+#endif
         } else if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_outershelld_api_socket_path, sizeof(g_outershelld_api_socket_path));
         } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
@@ -1890,10 +2042,17 @@ int main(int argc, char **argv) {
         default_socket_path(socket_path, sizeof(socket_path));
     }
 
-    snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
-             "%s/FilesContent.bundle.macos-arm.aar", bundles_dir);
-    snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
-             "%s/FilesContent.bundle.macos-x86.aar", bundles_dir);
+    if (bundles_dir) {
+        snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
+                 "%s/FilesContent.bundle.macos-arm.aar", bundles_dir);
+        snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
+                 "%s/FilesContent.bundle.macos-x86.aar", bundles_dir);
+    } else if (!g_bundle_file_path_macos_arm[0] || !g_bundle_file_path_macos_x86[0]) {
+        snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
+                 "%s", kBundleFilePathMacosArm);
+        snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
+                 "%s", kBundleFilePathMacosX86);
+    }
 
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);
@@ -1902,7 +2061,15 @@ int main(int argc, char **argv) {
 
     int listener = !use_port ? systemd_activated_listener() : -1;
     if (listener < 0) {
-        listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
+        if (use_port) {
+            listener = create_tcp_listener(port);
+#ifdef __APPLE__
+        } else if (launchd_socket_name[0]) {
+            listener = create_launchd_unix_listener(launchd_socket_name, socket_path);
+#endif
+        } else {
+            listener = create_unix_listener(socket_path);
+        }
     } else if (socket_path[0]) {
         snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
     }

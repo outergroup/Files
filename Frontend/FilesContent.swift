@@ -87,6 +87,17 @@ private enum FilePreviewKind {
     case media
 }
 
+private struct FilePreviewMetadata: Sendable, Equatable {
+    let size: UInt64
+    let modifiedMillis: UInt64
+}
+
+private enum FilePreviewMetadataBinaryFormat {
+    static let magic: UInt32 = 0x534d5046
+    static let version: UInt32 = 1
+    static let size = 24
+}
+
 private final class PreviewTextFragmentLayer: CALayer {
     var appearance: NSAppearance = .currentDrawing() {
         didSet {
@@ -393,6 +404,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var filesEndpoint: URL?
     private var openersEndpoint: URL?
     private var previewEndpoint: URL?
+    private var previewMetadataEndpoint: URL?
     private var downloadEndpoint: URL?
     private var uploadEndpoint: URL?
     private var mkdirEndpoint: URL?
@@ -438,6 +450,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var previewIsLoading = false
     private var previewScrollOffset: CGFloat = 0
     private var previewRequestGeneration = 0
+    private var previewObservedMetadata: FilePreviewMetadata?
+    private var previewMonitorTask: Task<Void, Never>?
+    private var previewMetadataRequestInFlight = false
     private var previewRenderedText = ""
     private var previewAttributedText = NSAttributedString(string: "")
     private var previewTextContentGeneration = 0
@@ -484,6 +499,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         self.appConnection = appConnection
         super.init()
         retainedSelf = self
+    }
+
+    deinit {
+        previewMonitorTask?.cancel()
     }
 
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
@@ -590,6 +609,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                              snapshot: buildAccessibilitySnapshot())
 
         case .shutdown:
+            stopPreviewChangeMonitoring()
             retainedSelf = nil
 
         default:
@@ -598,6 +618,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        stopPreviewChangeMonitoring()
         retainedSelf = nil
     }
 
@@ -606,6 +627,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
             openersEndpoint = URL(string: "/api/openers", relativeTo: base)?.absoluteURL
             previewEndpoint = URL(string: "/api/preview", relativeTo: base)?.absoluteURL
+            previewMetadataEndpoint = URL(string: "/api/preview-metadata", relativeTo: base)?.absoluteURL
             downloadEndpoint = URL(string: "/api/download", relativeTo: base)?.absoluteURL
             uploadEndpoint = URL(string: "/api/upload", relativeTo: base)?.absoluteURL
             mkdirEndpoint = URL(string: "/api/mkdir", relativeTo: base)?.absoluteURL
@@ -807,7 +829,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func updateColors() {
         appearance.performAsCurrentDrawingAppearance {
             withoutImplicitAnimations {
-                rootLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+                rootLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 favoritesBarLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 breadcrumbBarLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.92).cgColor
                 headerLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.92).cgColor
@@ -1819,6 +1841,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func updatePreviewForSelection() {
+        stopPreviewChangeMonitoring()
         guard let entry = selectedFileEntry() else {
             showCurrentFolderInfo()
             return
@@ -1844,6 +1867,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             showInfo(for: entry, additionalText: nil, preservingGeneration: true)
             return
         }
+        startPreviewChangeMonitoring(entry: entry,
+                                     generation: generation,
+                                     preferredKind: kind,
+                                     initialMetadata: FilePreviewMetadata(size: entry.size,
+                                                                          modifiedMillis: UInt64(max(entry.modified * 1000.0, 0))))
         if kind == .media {
             previewIsLoading = true
             showLoadingPreviewIfStillPending(entry: entry, generation: generation)
@@ -1861,6 +1889,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func showCurrentFolderInfo(preservingGeneration: Bool = false) {
+        stopPreviewChangeMonitoring()
         if !preservingGeneration {
             previewRequestGeneration += 1
         }
@@ -1879,6 +1908,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func showInfo(for entry: FileEntry,
                           additionalText: String?,
                           preservingGeneration: Bool = false) {
+        stopPreviewChangeMonitoring()
         if !preservingGeneration {
             previewRequestGeneration += 1
         }
@@ -1937,6 +1967,96 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             self.previewMessage = "Loading preview..."
             self.renderPreviewPane()
         }
+    }
+
+    private func startPreviewChangeMonitoring(entry: FileEntry,
+                                              generation: Int,
+                                              preferredKind: FilePreviewKind,
+                                              initialMetadata: FilePreviewMetadata) {
+        previewMonitorTask?.cancel()
+        previewObservedMetadata = initialMetadata
+        previewMetadataRequestInFlight = false
+        previewMonitorTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self,
+                      !Task.isCancelled,
+                      self.previewRequestGeneration == generation,
+                      self.selectedFileEntry()?.path == entry.path,
+                      self.previewPath == entry.path else {
+                    return
+                }
+                self.requestPreviewMetadataCheck(for: entry,
+                                                 generation: generation,
+                                                 preferredKind: preferredKind)
+            }
+        }
+    }
+
+    private func stopPreviewChangeMonitoring() {
+        previewMonitorTask?.cancel()
+        previewMonitorTask = nil
+        previewObservedMetadata = nil
+        previewMetadataRequestInFlight = false
+    }
+
+    private func requestPreviewMetadataCheck(for entry: FileEntry,
+                                             generation: Int,
+                                             preferredKind: FilePreviewKind) {
+        guard !previewMetadataRequestInFlight,
+              let previewMetadataEndpoint,
+              let urlSession,
+              let request = Self.binaryPathRequest(url: previewMetadataEndpoint,
+                                                   magic: FilePathRequestBinaryFormat.magic,
+                                                   path: entry.path) else {
+            return
+        }
+
+        previewMetadataRequestInFlight = true
+        urlSession.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self,
+                      self.previewRequestGeneration == generation,
+                      self.selectedFileEntry()?.path == entry.path,
+                      self.previewPath == entry.path else {
+                    return
+                }
+                self.previewMetadataRequestInFlight = false
+
+                if error != nil {
+                    return
+                }
+                if let httpResponse = response as? HTTPURLResponse,
+                   httpResponse.statusCode == 404 {
+                    self.previewRequestGeneration += 1
+                    self.previewBodyText = ""
+                    self.previewMessage = "File no longer exists."
+                    self.setPreviewImage(nil)
+                    self.previewScrollOffset = 0
+                    self.renderPreviewPane()
+                    self.stopPreviewChangeMonitoring()
+                    return
+                }
+                guard let data,
+                      let metadata = Self.decodePreviewMetadata(data) else {
+                    return
+                }
+
+                if self.previewObservedMetadata == metadata {
+                    return
+                }
+
+                self.previewObservedMetadata = metadata
+                self.previewRequestGeneration += 1
+                let nextGeneration = self.previewRequestGeneration
+                self.previewIsLoading = true
+                self.startPreviewChangeMonitoring(entry: entry,
+                                                  generation: nextGeneration,
+                                                  preferredKind: preferredKind,
+                                                  initialMetadata: metadata)
+                self.fetchPreview(for: entry, generation: nextGeneration, preferredKind: preferredKind)
+            }
+        }.resume()
     }
 
     private func previewKind(for entry: FileEntry) -> FilePreviewKind {
@@ -3127,6 +3247,18 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                      accessFlags: accessFlags))
         }
         return FileListResponse(path: path, parent: parent.isEmpty ? nil : parent, entries: entries)
+    }
+
+    nonisolated private static func decodePreviewMetadata(_ data: Data) -> FilePreviewMetadata? {
+        guard data.count >= FilePreviewMetadataBinaryFormat.size else { return nil }
+        var cursor = BinaryPayloadCursor(data)
+        guard cursor.readUInt32() == FilePreviewMetadataBinaryFormat.magic,
+              cursor.readUInt32() == FilePreviewMetadataBinaryFormat.version,
+              let size = cursor.readUInt64(),
+              let modifiedMillis = cursor.readUInt64() else {
+            return nil
+        }
+        return FilePreviewMetadata(size: size, modifiedMillis: modifiedMillis)
     }
 
     nonisolated private static func decodeFileOpeners(_ data: Data) -> [FileOpener]? {

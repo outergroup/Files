@@ -6,6 +6,7 @@ export COPYFILE_DISABLE=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-${REPO_ROOT}/build/frontend}"
+MACOS_BUILD_ROOT="${MACOS_BUILD_ROOT:-${REPO_ROOT}/build/macos}"
 PACKAGE_ROOT="${PACKAGE_ROOT:-${REPO_ROOT}/build/linux-package}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/build/release}"
 CONFIGURATION="${CONFIGURATION:-Release}"
@@ -21,7 +22,16 @@ require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/FilesBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/FilesBackend"
 require_file "${REPO_ROOT}/app-icon.png"
 
-mkdir -p "${OUTPUT_ROOT}" "${PACKAGE_ROOT}/bundles"
+mkdir -p "${OUTPUT_ROOT}" "${PACKAGE_ROOT}/bundles" "${MACOS_BUILD_ROOT}/${CONFIGURATION}"
+
+echo "==> Building FilesBackend for macOS"
+cc -std=gnu17 -Wall -Wextra -O2 \
+    -arch arm64 -arch x86_64 \
+    -mmacosx-version-min=14.6 \
+    -o "${MACOS_BUILD_ROOT}/${CONFIGURATION}/FilesBackend" \
+    "${REPO_ROOT}/Backend/main.c"
+
+require_file "${MACOS_BUILD_ROOT}/${CONFIGURATION}/FilesBackend"
 
 echo "==> Building Files frontend"
 /usr/bin/xcodebuild \
@@ -48,21 +58,76 @@ OUTPUT_APP_ROOT="${OUTPUT_ROOT}/Files"
 rm -rf "${OUTPUT_APP_ROOT}"
 mkdir -p "${OUTPUT_APP_ROOT}"
 
+install_shared_resources() {
+    local app_root="$1"
+    mkdir -p "${app_root}/bundles"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-arm.aar" "${app_root}/bundles/FilesContent.bundle.macos-arm.aar"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-x86.aar" "${app_root}/bundles/FilesContent.bundle.macos-x86.aar"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+}
+
+write_info_plist() {
+    local app_bundle="$1"
+    cat > "${app_bundle}/Contents/Info.plist" <<'__FILES_INFO_PLIST__'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>FilesBackend</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.outershell.Files</string>
+    <key>CFBundleName</key>
+    <string>Files</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+</dict>
+</plist>
+__FILES_INFO_PLIST__
+}
+
 package_linux_variant() {
     local arch="$1"
     local output_name="$2"
     local app_root="${STAGING_ROOT}/Files"
     rm -rf "${app_root}"
-    mkdir -p \
-        "${app_root}/RemoteLinuxBinaries/${arch}" \
-        "${app_root}/bundles"
+    mkdir -p "${app_root}/RemoteLinuxBinaries/${arch}"
+    install_shared_resources "${app_root}"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/FilesBackend" "${app_root}/RemoteLinuxBinaries/${arch}/FilesBackend"
-    install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-arm.aar" "${app_root}/bundles/FilesContent.bundle.macos-arm.aar"
-    install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-x86.aar" "${app_root}/bundles/FilesContent.bundle.macos-x86.aar"
-    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
+    echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
+}
+
+package_macos_variant() {
+    local arch="$1"
+    local output_name="$2"
+    local app_root="${STAGING_ROOT}/Files"
+    local macos_app_root="${app_root}/Files.app"
+    rm -rf "${app_root}"
+    mkdir -p \
+        "${macos_app_root}/Contents/MacOS" \
+        "${macos_app_root}/Contents/Resources/bundles"
+    install_shared_resources "${app_root}"
+    /usr/bin/lipo "${MACOS_BUILD_ROOT}/${CONFIGURATION}/FilesBackend" -thin "${arch}" -output "${macos_app_root}/Contents/MacOS/FilesBackend"
+    chmod 0755 "${macos_app_root}/Contents/MacOS/FilesBackend"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-arm.aar" "${macos_app_root}/Contents/Resources/bundles/FilesContent.bundle.macos-arm.aar"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-x86.aar" "${macos_app_root}/Contents/Resources/bundles/FilesContent.bundle.macos-x86.aar"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${macos_app_root}/Contents/Resources/app-icon.png"
+    write_info_plist "${macos_app_root}"
+    if command -v /usr/bin/codesign >/dev/null 2>&1; then
+        /usr/bin/codesign --force --sign - --timestamp=none "${macos_app_root}" >/dev/null
+    fi
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
 
 package_linux_variant aarch64 linux-aarch64
 package_linux_variant x86_64 linux-x86_64
+package_macos_variant arm64 macos-arm64
+package_macos_variant x86_64 macos-x86_64
