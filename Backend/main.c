@@ -416,16 +416,17 @@ enum {
     FILE_OPENERS_REQUEST_BINARY_MAGIC = 0x514f464fu,
     FILE_OPENERS_BINARY_VERSION = 2,
     FILE_OPENERS_BINARY_HEADER_SIZE = 32,
-    FILE_OPENERS_API_ROW_SIZE = 40,
+    FILE_OPENERS_API_ROW_SIZE = 44,
+    FILE_OPENERS_API_STRING_FIELD_COUNT = 5,
     FILE_OPENERS_BINARY_ROW_SIZE = 48
 };
 
 enum {
     OUTERSHELLD_API_APP_ADD_REQUEST = 13,
     OUTERSHELLD_API_APP_REMOVE_REQUEST = 14,
-    OUTERSHELLD_API_FILE_OPENERS_QUERY = 31,
+    OUTERSHELLD_API_FILE_OPENERS_QUERY = 25,
     OUTERSHELLD_API_COMMAND_RESPONSE = 100,
-    OUTERSHELLD_API_FILE_OPENERS_RESPONSE = 107,
+    OUTERSHELLD_API_FILE_OPENERS_RESPONSE = 106,
     OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE = 18,
     OUTERSHELLD_API_MAX_FRAME_SIZE = 16 * 1024 * 1024
 };
@@ -780,7 +781,8 @@ static void send_openers_response_for_path(int fd,
         size_t api_row_offset = OUTERSHELLD_API_FILE_OPENERS_RESPONSE_FIXED_SIZE + (size_t)i * FILE_OPENERS_API_ROW_SIZE;
         const unsigned char *socket_path = NULL;
         size_t socket_path_length = 0;
-        for (size_t field_offset = 0; ok && field_offset < FILE_OPENERS_API_ROW_SIZE; field_offset += 8) {
+        for (size_t field_index = 0; ok && field_index < FILE_OPENERS_API_STRING_FIELD_COUNT; field_index++) {
+            size_t field_offset = field_index * 8;
             const unsigned char *value = NULL;
             size_t value_length = 0;
             ok = read_binary_string_ref_view(api_bytes, api_response.length, api_row_offset + field_offset, &value, &value_length) &&

@@ -10,6 +10,7 @@ MACOS_BUILD_ROOT="${MACOS_BUILD_ROOT:-${REPO_ROOT}/build/macos}"
 PACKAGE_ROOT="${PACKAGE_ROOT:-${REPO_ROOT}/build/linux-package}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/build/release}"
 CONFIGURATION="${CONFIGURATION:-Release}"
+APP_CODESIGN_IDENTITY="${APP_CODESIGN_IDENTITY:-${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}}"
 
 require_file() {
     if [[ ! -f "$1" ]]; then
@@ -23,6 +24,26 @@ require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/FilesBackend"
 require_file "${REPO_ROOT}/app-icon.png"
 
 mkdir -p "${OUTPUT_ROOT}" "${PACKAGE_ROOT}/bundles" "${MACOS_BUILD_ROOT}/${CONFIGURATION}"
+
+macos_codesign_args() {
+    if [[ "${APP_CODESIGN_IDENTITY}" == "-" ]]; then
+        printf '%s\n' --force --sign - --timestamp=none
+    else
+        printf '%s\n' --force --options runtime --timestamp --sign "${APP_CODESIGN_IDENTITY}"
+    fi
+}
+
+sign_macos_app() {
+    local path="$1"
+    if ! command -v /usr/bin/codesign >/dev/null 2>&1; then
+        return 0
+    fi
+    local args=()
+    while IFS= read -r arg; do
+        args+=("$arg")
+    done < <(macos_codesign_args)
+    /usr/bin/codesign "${args[@]}" "$path" >/dev/null
+}
 
 echo "==> Building FilesBackend for macOS"
 cc -std=gnu17 -Wall -Wextra -O2 \
@@ -120,9 +141,7 @@ package_macos_variant() {
     install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-x86.aar" "${macos_app_root}/Contents/Resources/bundles/FilesContent.bundle.macos-x86.aar"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${macos_app_root}/Contents/Resources/app-icon.png"
     write_info_plist "${macos_app_root}"
-    if command -v /usr/bin/codesign >/dev/null 2>&1; then
-        /usr/bin/codesign --force --sign - --timestamp=none "${macos_app_root}" >/dev/null
-    fi
+    sign_macos_app "${macos_app_root}"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
