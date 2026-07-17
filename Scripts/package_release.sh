@@ -21,6 +21,8 @@ require_file() {
 
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/FilesBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/FilesBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/aarch64/FilesBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/x86_64/FilesBackend"
 require_file "${REPO_ROOT}/app-icon.png"
 
 mkdir -p "${OUTPUT_ROOT}" "${PACKAGE_ROOT}/bundles" "${MACOS_BUILD_ROOT}/${CONFIGURATION}"
@@ -115,12 +117,15 @@ __FILES_INFO_PLIST__
 
 package_linux_variant() {
     local arch="$1"
-    local output_name="$2"
+    local libc="$2"
+    local output_name="$3"
+    local binary_directory=RemoteLinuxBinaries
+    [[ "${libc}" == musl ]] && binary_directory=RemoteLinuxBinariesMusl
     local app_root="${STAGING_ROOT}/Files"
     rm -rf "${app_root}"
-    mkdir -p "${app_root}/RemoteLinuxBinaries/${arch}"
+    mkdir -p "${app_root}/${binary_directory}/${arch}"
     install_shared_resources "${app_root}"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/FilesBackend" "${app_root}/RemoteLinuxBinaries/${arch}/FilesBackend"
+    install -m 0755 "${PACKAGE_ROOT}/${binary_directory}/${arch}/FilesBackend" "${app_root}/${binary_directory}/${arch}/FilesBackend"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
@@ -146,7 +151,9 @@ package_macos_variant() {
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
 
-package_linux_variant aarch64 linux-aarch64
-package_linux_variant x86_64 linux-x86_64
+package_linux_variant aarch64 glibc linux-aarch64
+package_linux_variant x86_64 glibc linux-x86_64
+package_linux_variant aarch64 musl linux-aarch64-musl
+package_linux_variant x86_64 musl linux-x86_64-musl
 package_macos_variant arm64 macos-arm64
 package_macos_variant x86_64 macos-x86_64

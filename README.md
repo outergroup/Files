@@ -8,6 +8,21 @@ Files is a minimal outerframe app for browsing a directory over the same backend
 ./build_run.sh
 ```
 
+## Deploy Over SSH
+
+With a current Outer Shell installed on the target:
+
+```bash
+./app target "ssh -p 22 you@server"
+./app deploy
+```
+
+The deploy target is stored in the gitignored `target.env`. Deployment detects
+the target architecture and libc and builds only the matching dynamic backend.
+glibc builds use the manylinux2014 (glibc 2.17) baseline; musl builds use
+musllinux 1.2. Run `./app build-matrix` to build all four Linux release
+variants, or `./app help` for the other development commands.
+
 ## Run
 
 ```bash
@@ -51,10 +66,6 @@ The archive is written to `build/release/Files.tar.gz`. Deployment-specific
 publishing should live outside this repository.
 
 ## Remote Development
-
-This public repository intentionally does not contain host-specific deployment
-scripts. Private lab deployments should live in an external deployment
-workspace.
 
 To test a deployed remote host with curl:
 
