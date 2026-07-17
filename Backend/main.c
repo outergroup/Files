@@ -28,6 +28,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "HTTPCache.h"
+
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
@@ -248,7 +250,42 @@ static void send_text_response(int fd, int status, const char *message) {
     send_response(fd, status, status_text, "text/plain; charset=utf-8", message, strlen(message));
 }
 
-static void send_outer_descriptor(int fd) {
+static void send_cached_header(int fd,
+                               int status,
+                               const char *content_type,
+                               size_t content_length,
+                               const char *etag,
+                               const char *last_modified) {
+    char header[1024];
+    size_t header_length = outer_http_cache_response_header(header, sizeof(header), status,
+                                                            content_type, content_length,
+                                                            etag, last_modified);
+    if (header_length > 0) queue_all(fd, header, header_length);
+}
+
+static void send_cached_memory_response(int fd,
+                                        const char *request,
+                                        size_t request_header_length,
+                                        const char *content_type,
+                                        const void *body,
+                                        size_t body_length,
+                                        bool send_body) {
+    time_t last_modified = outer_http_cache_server_start_time();
+    char etag[96], last_modified_text[64];
+    outer_http_cache_memory_etag(body, body_length, etag, sizeof(etag));
+    outer_http_cache_format_date(last_modified, last_modified_text, sizeof(last_modified_text));
+    if (outer_http_cache_not_modified(request, request_header_length, etag, &last_modified)) {
+        send_cached_header(fd, 304, content_type, 0, etag, last_modified_text);
+        return;
+    }
+    send_cached_header(fd, 200, content_type, body_length, etag, last_modified_text);
+    if (send_body && body_length > 0) queue_all(fd, body, body_length);
+}
+
+static void send_outer_descriptor(int fd,
+                                  const char *request,
+                                  size_t request_header_length,
+                                  bool send_body) {
     const char *plugin_json = "{\"filesAPIPath\":\"/api/files\",\"openersAPIPath\":\"/api/openers\",\"previewAPIPath\":\"/api/preview\",\"rootPath\":\"~\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_json);
@@ -273,8 +310,72 @@ static void send_outer_descriptor(int fd) {
     memcpy(payload + header_len, kBundleUrlPath, path_len);
     memcpy(payload + data_offset, plugin_json, plugin_len);
 
-    send_response(fd, 200, "OK", "application/vnd.outerframe", payload, total_len);
+    send_cached_memory_response(fd, request, request_header_length,
+                                "application/vnd.outerframe", payload, total_len,
+                                send_body);
     free(payload);
+}
+
+static void send_cached_bundle_file(int fd,
+                                    const char *path,
+                                    const char *request,
+                                    size_t request_header_length,
+                                    bool send_body) {
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        char message[PATH_MAX + 64];
+        snprintf(message, sizeof(message), "bundle not found at %s\n", path);
+        send_text_response(fd, 404, message);
+        return;
+    }
+    struct stat st;
+    if (fstat(file_fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode)) {
+        close(file_fd);
+        send_text_response(fd, 500, "failed to stat bundle\n");
+        return;
+    }
+    char etag[96], last_modified[64];
+    outer_http_cache_file_etag(&st, etag, sizeof(etag));
+    outer_http_cache_format_date(st.st_mtime, last_modified, sizeof(last_modified));
+    if (outer_http_cache_not_modified(request, request_header_length, etag, &st.st_mtime)) {
+        close(file_fd);
+        send_cached_header(fd, 304, "application/octet-stream", 0, etag, last_modified);
+        return;
+    }
+    size_t size = (size_t)st.st_size;
+    if (!send_body) {
+        close(file_fd);
+        send_cached_header(fd, 200, "application/octet-stream", size, etag, last_modified);
+        return;
+    }
+    unsigned char *data = malloc(size > 0 ? size : 1);
+    if (!data) {
+        close(file_fd);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    size_t offset = 0;
+    while (offset < size) {
+        ssize_t got = read(file_fd, data + offset, size - offset);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            free(data);
+            close(file_fd);
+            send_text_response(fd, 500, "failed to read bundle\n");
+            return;
+        }
+        if (got == 0) break;
+        offset += (size_t)got;
+    }
+    close(file_fd);
+    if (offset != size) {
+        free(data);
+        send_text_response(fd, 500, "failed to read bundle\n");
+        return;
+    }
+    send_cached_header(fd, 200, "application/octet-stream", size, etag, last_modified);
+    if (size > 0) queue_all(fd, data, size);
+    free(data);
 }
 
 static void send_bundle_file(int fd, const char *path) {
@@ -1567,7 +1668,11 @@ static int set_blocking(int fd) {
     return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 }
 
-static void handle_http_request(int fd, char *request, unsigned char *body, size_t content_length) {
+static void handle_http_request(int fd,
+                                char *request,
+                                size_t request_header_length,
+                                unsigned char *body,
+                                size_t content_length) {
     set_blocking(fd);
 
     struct timeval timeout;
@@ -1664,18 +1769,21 @@ static void handle_http_request(int fd, char *request, unsigned char *body, size
         free(body);
     } else if (strcmp(target, "/") == 0 || strcmp(target, "/files.outer") == 0) {
         free(body);
-        send_outer_descriptor(fd);
+        send_outer_descriptor(fd, request, request_header_length,
+                              strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
         free(body);
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
     } else if (strcmp(target, kBundleUrlPathMacosArm) == 0) {
         free(body);
         const char *path = g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm;
-        send_bundle_file(fd, path);
+        send_cached_bundle_file(fd, path, request, request_header_length,
+                                strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, kBundleUrlPathMacosX86) == 0) {
         free(body);
         const char *path = g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86;
-        send_bundle_file(fd, path);
+        send_cached_bundle_file(fd, path, request, request_header_length,
+                                strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/api/files") == 0) {
         free(body);
         send_files_response(fd, query, requester_user);
@@ -1845,7 +1953,8 @@ static void run_server_loop(int listener) {
                 continue;
             }
             if (http_client_has_complete_request(client)) {
-                handle_http_request(client->fd, client->request, client->body, client->content_length);
+                handle_http_request(client->fd, client->request, client->header_len,
+                                    client->body, client->content_length);
                 client->body = NULL;
                 close_http_client(client);
                 continue;
