@@ -27,6 +27,69 @@ require_tool() {
     }
 }
 
+BUILD_CONTAINER_RUNTIME=""
+
+apple_container_is_ready() {
+    command -v container >/dev/null 2>&1 &&
+        container system status >/dev/null 2>&1
+}
+
+docker_is_ready() {
+    command -v docker >/dev/null 2>&1 &&
+        docker info >/dev/null 2>&1
+}
+
+select_build_container_runtime() {
+    case "${OUTER_BUILD_CONTAINER_RUNTIME:-auto}" in
+        auto)
+            if [[ "$(uname -s)" == Darwin ]] && apple_container_is_ready; then
+                BUILD_CONTAINER_RUNTIME=container
+            elif docker_is_ready; then
+                BUILD_CONTAINER_RUNTIME=docker
+            elif apple_container_is_ready; then
+                BUILD_CONTAINER_RUNTIME=container
+            else
+                return 1
+            fi
+            ;;
+        container)
+            apple_container_is_ready || return 1
+            BUILD_CONTAINER_RUNTIME=container
+            ;;
+        docker)
+            docker_is_ready || return 1
+            BUILD_CONTAINER_RUNTIME=docker
+            ;;
+        *)
+            echo "error: OUTER_BUILD_CONTAINER_RUNTIME must be auto, container, or docker" >&2
+            return 2
+            ;;
+    esac
+}
+
+build_container_runtime_is_ready() {
+    select_build_container_runtime && return 0
+    local status=$?
+    [[ "${status}" -ne 2 ]] || exit 1
+    return "${status}"
+}
+
+require_build_container_runtime() {
+    select_build_container_runtime && return 0
+    local status=$?
+    [[ "${status}" -ne 2 ]] || exit 1
+    echo "error: no supported build container runtime is ready" >&2
+    echo "       start Apple container or Docker, or set OUTER_BUILD_CONTAINER_RUNTIME" >&2
+    exit 1
+}
+
+ensure_internal_container_network() {
+    local network="$1"
+    if ! container network list --quiet | grep -Fxq "${network}"; then
+        container network create --internal "${network}" >/dev/null
+    fi
+}
+
 shell_quote() {
     local value="$1"
     printf "'%s'" "${value//\'/\'\\\'\'}"
@@ -113,8 +176,8 @@ cmd_build_frontend() {
     require_tool aa
     require_tool lipo
 
-    rm -rf "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles"
-    mkdir -p "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles"
+    rm -rf "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web"
+    mkdir -p "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web"
     echo "==> Building ${APP_NAME} frontend"
     /usr/bin/xcodebuild \
         -project "${ROOT}/${XCODE_PROJECT}" \
@@ -134,6 +197,7 @@ cmd_build_frontend() {
         "${STAGE_ROOT}/bundles" \
         "${BUNDLE_ARCHIVE_STEM}"
     install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
+    install -m 0644 "${ROOT}/Resources/FilesWeb/index.html" "${ROOT}/Resources/FilesWeb/app.css" "${ROOT}/Resources/FilesWeb/app.js" "${ROOT}/Resources/FilesWeb/folder-icon.png" "${STAGE_ROOT}/web/"
 }
 
 backend_directory() {
@@ -158,30 +222,50 @@ backend_platform() {
     [[ "$1" == aarch64 ]] && printf 'linux/arm64\n' || printf 'linux/amd64\n'
 }
 
-build_backend_in_docker() {
+build_backend_in_container() {
     local libc="$1" arch="$2" output_root="$3"
-    local image platform output_dir
+    local image platform output_dir network
     image="$(backend_image "${libc}" "${arch}")"
     platform="$(backend_platform "${arch}")"
     output_dir="$(backend_directory "${output_root}" "${libc}" "${arch}")"
+    network="bundled-app-build-$(printf '%s' "${APP_ID}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')-internal"
+    if [[ -z "${BUILD_CONTAINER_RUNTIME}" ]]; then
+        require_build_container_runtime
+    fi
     echo "==> Building ${BACKEND_EXECUTABLE_NAME} for Linux/${arch}/${libc}"
     mkdir -p "${output_dir}"
-    docker run --rm --platform "${platform}" \
-        -v "${ROOT}:/src:ro" \
-        -v "${output_dir}:/out" \
-        -e CC=gcc \
-        -e "BACKEND_SOURCE=${BACKEND_SOURCE}" \
-        -e "BACKEND_EXECUTABLE_NAME=${BACKEND_EXECUTABLE_NAME}" \
-        -e "BACKEND_CFLAGS=${BACKEND_CFLAGS}" \
-        -e "BACKEND_LDFLAGS=${BACKEND_LDFLAGS}" \
-        "${image}" \
-        bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
+    if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
+        ensure_internal_container_network "${network}"
+        container run --rm --platform "${platform}" \
+            --network "${network}" \
+            --mount "type=bind,source=${ROOT}/Backend,target=/src/Backend,readonly" \
+            --mount "type=bind,source=${output_dir},target=/out" \
+            --env CC=gcc \
+            --env "BACKEND_SOURCE=${BACKEND_SOURCE}" \
+            --env "BACKEND_EXECUTABLE_NAME=${BACKEND_EXECUTABLE_NAME}" \
+            --env "BACKEND_CFLAGS=${BACKEND_CFLAGS}" \
+            --env "BACKEND_LDFLAGS=${BACKEND_LDFLAGS}" \
+            "${image}" \
+            bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
+    else
+        docker run --rm --platform "${platform}" \
+            --network none \
+            --mount "type=bind,source=${ROOT}/Backend,target=/src/Backend,readonly" \
+            --mount "type=bind,source=${output_dir},target=/out" \
+            --env CC=gcc \
+            --env "BACKEND_SOURCE=${BACKEND_SOURCE}" \
+            --env "BACKEND_EXECUTABLE_NAME=${BACKEND_EXECUTABLE_NAME}" \
+            --env "BACKEND_CFLAGS=${BACKEND_CFLAGS}" \
+            --env "BACKEND_LDFLAGS=${BACKEND_LDFLAGS}" \
+            "${image}" \
+            bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
+    fi
 }
 
 build_backend_on_target() {
     local output_dir remote_build=".cache/outershell-app-build/${APP_ID}"
     output_dir="$(backend_directory "${STAGE_ROOT}" "${TARGET_LIBC}" "${TARGET_ARCH}")"
-    echo "==> Docker is unavailable; building ${BACKEND_EXECUTABLE_NAME} on the ${TARGET_LIBC} target"
+    echo "==> No build container runtime is available; building ${BACKEND_EXECUTABLE_NAME} on the ${TARGET_LIBC} target"
     COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend | run_ssh "
         set -e
         rm -rf \"\$HOME/${remote_build}\"
@@ -200,8 +284,8 @@ build_backend_on_target() {
 
 build_target_backend() {
     if [[ "${OUTER_BUILD_MODE:-auto}" != target ]] &&
-       command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        build_backend_in_docker "${TARGET_LIBC}" "${TARGET_ARCH}" "${STAGE_ROOT}"
+       build_container_runtime_is_ready; then
+        build_backend_in_container "${TARGET_LIBC}" "${TARGET_ARCH}" "${STAGE_ROOT}"
     else
         build_backend_on_target
     fi
@@ -213,13 +297,12 @@ cmd_build_backend() {
 }
 
 cmd_build_matrix() {
-    require_tool docker
-    docker info >/dev/null
+    require_build_container_runtime
     rm -rf "${MATRIX_ROOT}/RemoteLinuxBinaries" "${MATRIX_ROOT}/RemoteLinuxBinariesMusl"
     local libc arch
     for libc in glibc musl; do
         for arch in aarch64 x86_64; do
-            build_backend_in_docker "${libc}" "${arch}" "${MATRIX_ROOT}"
+            build_backend_in_container "${libc}" "${arch}" "${MATRIX_ROOT}"
         done
     done
     echo "==> Linux backend matrix ready at ${MATRIX_ROOT}"
@@ -340,6 +423,9 @@ ${APP_NAME} development tasks
   ./app ssh [command]     open a shell or run a target command
   ./app uninstall         uninstall the target app
   ./app clean             remove development build products
+
+Builds auto-select Apple container on macOS and Docker elsewhere.
+Set OUTER_BUILD_CONTAINER_RUNTIME=container|docker to override.
 EOF
 }
 
