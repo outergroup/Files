@@ -48,6 +48,7 @@ static const char *kBundleFilePathMacosX86 = "bundles/FilesContent.bundle.macos-
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
+static char g_web_root[PATH_MAX] = "";
 static char g_backend_label[256] = "org.outershell.Files";
 static char g_outershelld_api_socket_path[PATH_MAX] = "";
 static char g_app_icon_path[PATH_MAX] = "";
@@ -105,6 +106,7 @@ static void configure_resource_paths_from_app_bundle(void) {
     if (stat(icon_path, &st) == 0 && S_ISREG(st.st_mode)) {
         snprintf(g_app_icon_path, sizeof(g_app_icon_path), "%s", icon_path);
     }
+    snprintf(g_web_root, sizeof(g_web_root), "%s/Resources/web", contents_dir);
 }
 #endif
 
@@ -314,6 +316,58 @@ static void send_outer_descriptor(int fd,
                                 "application/vnd.outerframe", payload, total_len,
                                 send_body);
     free(payload);
+}
+
+static bool request_accepts_outerframe(const char *request, size_t request_header_length) {
+    static const char header_name[] = "Outerframe-Accept:";
+    static const char media_type[] = "application/vnd.outerframe";
+    const char *cursor = request;
+    const char *end = request + request_header_length;
+    while (cursor < end) {
+        const char *line_end = strstr(cursor, "\r\n");
+        if (!line_end || line_end > end) line_end = end;
+        if ((size_t)(line_end - cursor) >= sizeof(header_name) - 1 &&
+            strncasecmp(cursor, header_name, sizeof(header_name) - 1) == 0) {
+            const char *value = cursor + sizeof(header_name) - 1;
+            while (value < line_end && (*value == ' ' || *value == '\t')) value++;
+            size_t length = (size_t)(line_end - value);
+            return length >= sizeof(media_type) - 1 &&
+                   memmem(value, length, media_type, sizeof(media_type) - 1) != NULL;
+        }
+        cursor = line_end < end ? line_end + 2 : end;
+    }
+    return false;
+}
+
+static void send_web_file(int fd, const char *name, const char *content_type,
+                          const char *request, size_t request_header_length, bool send_body) {
+    const char *root = g_web_root[0] ? g_web_root : "web";
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", root, name) >= (int)sizeof(path)) {
+        send_text_response(fd, 404, "web asset not found\n");
+        return;
+    }
+    int file_fd = open(path, O_RDONLY);
+    struct stat st;
+    if (file_fd < 0 || fstat(file_fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode)) {
+        if (file_fd >= 0) close(file_fd);
+        send_text_response(fd, 404, "web asset not found\n");
+        return;
+    }
+    size_t length = (size_t)st.st_size;
+    unsigned char *data = malloc(length ? length : 1);
+    if (!data) { close(file_fd); send_text_response(fd, 500, "out of memory\n"); return; }
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t got = read(file_fd, data + offset, length - offset);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        offset += (size_t)got;
+    }
+    close(file_fd);
+    if (offset != length) { free(data); send_text_response(fd, 500, "failed to read web asset\n"); return; }
+    send_cached_memory_response(fd, request, request_header_length, content_type, data, length, send_body);
+    free(data);
 }
 
 static void send_cached_bundle_file(int fd,
@@ -1767,6 +1821,22 @@ static void handle_http_request(int fd,
         }
         send_upload_response(fd, query, body, content_length);
         free(body);
+    } else if (strcmp(target, "/") == 0 && !request_accepts_outerframe(request, request_header_length)) {
+        free(body);
+        send_web_file(fd, "index.html", "text/html; charset=utf-8", request, request_header_length,
+                      strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/app.css") == 0) {
+        free(body);
+        send_web_file(fd, "app.css", "text/css; charset=utf-8", request, request_header_length,
+                      strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/app.js") == 0) {
+        free(body);
+        send_web_file(fd, "app.js", "text/javascript; charset=utf-8", request, request_header_length,
+                      strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/folder-icon.png") == 0) {
+        free(body);
+        send_web_file(fd, "folder-icon.png", "image/png", request, request_header_length,
+                      strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/") == 0 || strcmp(target, "/files.outer") == 0) {
         free(body);
         send_outer_descriptor(fd, request, request_header_length,
@@ -1790,6 +1860,16 @@ static void handle_http_request(int fd,
     } else if (strcmp(target, "/api/openers") == 0) {
         free(body);
         send_openers_response(fd, query, requester_user);
+    } else if (strcmp(target, "/api/preview") == 0) {
+        char requested[PATH_MAX] = "";
+        query_value(query ? query : "", "path", requested, sizeof(requested));
+        free(body);
+        send_preview_response_for_path(fd, requested);
+    } else if (strcmp(target, "/api/preview-metadata") == 0) {
+        char requested[PATH_MAX] = "";
+        query_value(query ? query : "", "path", requested, sizeof(requested));
+        free(body);
+        send_preview_metadata_response_for_path(fd, requested);
     } else if (strcmp(target, "/api/download") == 0) {
         free(body);
         send_download_response(fd, query);
@@ -2107,7 +2187,7 @@ static int create_launchd_unix_listener(const char *socket_name, const char *soc
 #endif
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--web-root DIR] [--icon-file PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2142,6 +2222,9 @@ int main(int argc, char **argv) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+            snprintf(g_web_root, sizeof(g_web_root), "%s/../web", bundles_dir);
+        } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
+            snprintf(g_web_root, sizeof(g_web_root), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--icon-file") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_app_icon_path, sizeof(g_app_icon_path));
         } else {
