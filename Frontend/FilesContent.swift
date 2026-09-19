@@ -401,6 +401,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var appearance = NSAppearance.currentDrawing()
     private var currentSize = CGSize(width: 900, height: 600)
     private var urlSession: URLSession?
+    private var sessionUsername: String?
     private var filesEndpoint: URL?
     private var openersEndpoint: URL?
     private var previewEndpoint: URL?
@@ -508,6 +509,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
         switch message {
         case .initializeContent(let arguments):
+            sessionUsername = arguments.sessionUsername
             outerframeHost.configure(url: arguments.url ?? "",
                                      bundleUrl: arguments.bundleUrl ?? "",
                                      proxyHost: arguments.proxy?.host,
@@ -634,6 +636,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
+        if let sessionUsername, !sessionUsername.isEmpty {
+            configuration.httpAdditionalHeaders = ["X-Files-User": sessionUsername]
+        }
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         outerframeHost.applyProxy(to: configuration)
         urlSession = URLSession(configuration: configuration)

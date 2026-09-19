@@ -83,10 +83,14 @@ mkdir -p "${OUTPUT_APP_ROOT}"
 
 install_shared_resources() {
     local app_root="$1"
-    mkdir -p "${app_root}/bundles"
+    mkdir -p "${app_root}/bundles" "${app_root}/web"
     install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-arm.aar" "${app_root}/bundles/FilesContent.bundle.macos-arm.aar"
     install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-x86.aar" "${app_root}/bundles/FilesContent.bundle.macos-x86.aar"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/index.html" "${app_root}/web/index.html"
+    install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/app.css" "${app_root}/web/app.css"
+    install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/app.js" "${app_root}/web/app.js"
+    install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/folder-icon.png" "${app_root}/web/folder-icon.png"
 }
 
 write_info_plist() {

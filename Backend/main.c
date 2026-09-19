@@ -1754,7 +1754,7 @@ static void handle_http_request(int fd,
     }
 
     char requester_user[256];
-    request_header_value(request, "X-Outer-Loop-User", requester_user, sizeof(requester_user));
+    request_header_value(request, "X-Files-User", requester_user, sizeof(requester_user));
 
     if (strcasecmp(method, "POST") == 0) {
         if (strcmp(target, "/api/files") == 0) {

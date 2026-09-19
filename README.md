@@ -72,3 +72,13 @@ To test a deployed remote host with curl:
 ```bash
 ssh "$HOST" 'curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/org.outershell.Files" http://localhost/'
 ```
+
+### Requester context
+
+Files sends its own `X-Files-User` header on API requests. The web frontend reads
+`window.outerLoop.sessionContext` when hosted in Outer Loop; the native
+outerframe frontend uses `InitializeContentArguments.sessionUsername`. This is the
+session's SSH username (or local username in local mode), not proxy credentials.
+Without host context, Files omits the header and the backend uses its existing
+process-user fallback. The value supplies permission-display and file-opener
+context; it is not authentication proof.
