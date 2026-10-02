@@ -609,6 +609,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         case .accessibilityAction(let identifier, let action, let value):
             performAccessibilityAction(identifier: identifier, action: action, value: value)
 
+        case .accessibilityActionAndSnapshot(let requestID, let identifier, let action, let value):
+            performAccessibilityAction(identifier: identifier, action: action, value: value)
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: buildAccessibilitySnapshot())
+
+        case .accessibilityTextQuery(let requestID, let identifier, let query, let range, let point):
+            _ = buildAccessibilitySnapshot()
+            let result: OuterframeAccessibilityTextResult?
+            if accessibilityNodes[identifier]?.supportsTextGeometry == true, !previewPaneLayer.isHidden {
+                result = accessibilityPreviewLayout.query(query, range: range, point: point,
+                    text: previewRenderedText, generation: previewTextContentGeneration,
+                    viewport: rootLayer.convert(previewClipLayer.bounds, from: previewClipLayer),
+                    scrollOffset: previewScrollOffset, inset: CGSize(width: previewTextInsetX, height: previewTextInsetY))
+            } else { result = nil }
+            outerframeHost.sendAccessibilityTextResponse(requestID: requestID, result: result)
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: buildAccessibilitySnapshot())
@@ -4066,6 +4081,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file)
     }
 
+    private lazy var accessibilityPreviewLayout = FilesAccessibilityTextLayout(layoutManager: previewTextLayoutManager)
+
     private var accessibilityIdentifiers: [String: UInt32] = [:]
     private var accessibilityNodes: [UInt32: OuterframeAccessibilityNode] = [:]
 
@@ -4081,7 +4098,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             node.actions = [.press, .focus, .showMenu]
             node.rowIndex = index
             node.isSelected = selectedIndex == index
-            node.isFocused = node.isSelected
+            node.isFocused = node.isSelected && previewTextSelectionRange == nil
             node.children = node.children.enumerated().map { column, child in
                 var cell = child
                 cell.rowIndex = index
@@ -4090,10 +4107,16 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             }
         }
         if node.role == .table { node.actions = [.scrollUp, .scrollDown] }
-        if node.label?.hasPrefix("Preview of ") == true {
-            node.role = .scrollArea
-            node.actions = [.scrollUp, .scrollDown]
+        if node.label?.hasPrefix("Preview of ") == true || node.label == "File preview" {
+            node.role = .textArea
+            node.frame = rootLayer.convert(previewClipLayer.bounds, from: previewClipLayer)
+            node.value = previewRenderedText
+            node.actions = [.scrollUp, .scrollDown, .setSelectedTextRange]
+            node.selectedTextRange = previewTextSelectionRange
+            node.isFocused = previewTextSelectionRange != nil
+            node.supportsTextGeometry = true
         }
+        node.supportsActionSnapshot = true
         node.children = node.children.map { prepareAccessibilityNode($0, key: identity) }
         accessibilityNodes[node.identifier] = node
         return node
@@ -4109,6 +4132,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             } else if node.role == .button, let path = node.value {
                 openDirectory(path: path)
             }
+        case .setSelectedTextRange:
+            guard node.supportsTextGeometry else { return }
+            let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]),
+                  OuterframeAccessibilityTextRange.isValid(NSRange(location: location, length: length), in: previewRenderedText) else { return }
+            setPreviewTextSelectionRange(NSRange(location: location, length: length))
         case .showMenu:
             handleRightMouseDown(at: CGPoint(x: node.frame.midX, y: node.frame.midY))
         case .scrollUp, .scrollDown:
