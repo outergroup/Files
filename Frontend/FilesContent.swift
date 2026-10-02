@@ -606,6 +606,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         case .historyTraversal(_, let url):
             fetchFiles(path: pathFromURL(url) ?? currentPath)
 
+        case .accessibilityAction(let identifier, let action, let value):
+            performAccessibilityAction(identifier: identifier, action: action, value: value)
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: buildAccessibilitySnapshot())
@@ -4063,12 +4066,69 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file)
     }
 
+    private var accessibilityIdentifiers: [String: UInt32] = [:]
+    private var accessibilityNodes: [UInt32: OuterframeAccessibilityNode] = [:]
+
+    private func prepareAccessibilityNode(_ original: OuterframeAccessibilityNode, key: String) -> OuterframeAccessibilityNode {
+        var node = original
+        let identity = key + "/" + (node.role == .row || node.role == .button ? (node.value ?? node.label ?? "") : (node.label ?? ""))
+        if accessibilityIdentifiers[identity] == nil {
+            accessibilityIdentifiers[identity] = UInt32(accessibilityIdentifiers.count + 1)
+        }
+        node.identifier = accessibilityIdentifiers[identity] ?? 0
+        if node.role == .button { node.actions = [.press] }
+        if node.role == .row, let path = node.value, let index = entries.firstIndex(where: { $0.path == path }) {
+            node.actions = [.press, .focus, .showMenu]
+            node.rowIndex = index
+            node.isSelected = selectedIndex == index
+            node.isFocused = node.isSelected
+            node.children = node.children.enumerated().map { column, child in
+                var cell = child
+                cell.rowIndex = index
+                cell.columnIndex = column
+                return cell
+            }
+        }
+        if node.role == .table { node.actions = [.scrollUp, .scrollDown] }
+        if node.label?.hasPrefix("Preview of ") == true {
+            node.role = .scrollArea
+            node.actions = [.scrollUp, .scrollDown]
+        }
+        node.children = node.children.map { prepareAccessibilityNode($0, key: identity) }
+        accessibilityNodes[node.identifier] = node
+        return node
+    }
+
+    private func performAccessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String) {
+        _ = buildAccessibilitySnapshot()
+        guard let node = accessibilityNodes[identifier], node.isEnabled, node.actions.supports(action) else { return }
+        switch action {
+        case .press, .focus:
+            if node.role == .row, let path = node.value, let index = entries.firstIndex(where: { $0.path == path }) {
+                selectIndex(index)
+            } else if node.role == .button, let path = node.value {
+                openDirectory(path: path)
+            }
+        case .showMenu:
+            handleRightMouseDown(at: CGPoint(x: node.frame.midX, y: node.frame.midY))
+        case .scrollUp, .scrollDown:
+            let direction: CGFloat = action == .scrollDown ? 1 : -1
+            if node.role == .table {
+                setRowsScroll(scrollOffset + direction * rowsClipLayer.bounds.height * 0.8)
+            } else {
+                setPreviewScroll(previewScrollOffset + direction * previewClipLayer.bounds.height * 0.8)
+            }
+        default: break
+        }
+        notifyAccessibilityLayoutChanged()
+    }
+
     private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
 
-        children.append(contentsOf: buildFavoritesAccessibilityNodes(nextIdentifier: &nextIdentifier))
-        children.append(contentsOf: buildBreadcrumbAccessibilityNodes(nextIdentifier: &nextIdentifier))
+        children.append(OuterframeAccessibilityNode(identifier: 0, role: .container, frame: favoritesBarLayer.frame, label: "Favorites", children: buildFavoritesAccessibilityNodes(nextIdentifier: &nextIdentifier)))
+        children.append(OuterframeAccessibilityNode(identifier: 0, role: .container, frame: breadcrumbBarLayer.frame, label: "Location", children: buildBreadcrumbAccessibilityNodes(nextIdentifier: &nextIdentifier)))
         children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                           role: .staticText,
                                           frame: headerLayer.convert(nameHeaderLayer.frame, to: rootLayer),
@@ -4113,7 +4173,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                    frame: rootLayer.bounds,
                                                    label: "Files",
                                                    children: children)
-        return OuterframeAccessibilitySnapshot(rootNodes: [rootNode])
+        accessibilityNodes.removeAll(keepingCapacity: true)
+        return OuterframeAccessibilitySnapshot(rootNodes: [prepareAccessibilityNode(rootNode, key: "")])
     }
 
     private func buildFavoritesAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
@@ -4160,10 +4221,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 let entry = entries[index]
                 let top = rowsClipLayer.bounds.height - CGFloat(index) * rowHeight + scrollOffset - rowHeight
                 let rowFrame = CGRect(x: 0, y: top, width: tableWidth, height: rowHeight)
+                guard rowFrame.intersects(rowsClipLayer.bounds) else { continue }
                 let type = entry.isDirectory ? "Folder" : "File"
                 let size = entry.isDirectory ? "" : formatByteCount(entry.size)
-                let selectedPrefix = selectedIndex == index ? "Selected, " : ""
-                let rowLabel = "\(selectedPrefix)\(entry.name), \(type), modified \(formatModified(entry.modified))\(size.isEmpty ? "" : ", \(size)")"
+                let rowLabel = "\(entry.name), \(type), modified \(formatModified(entry.modified))\(size.isEmpty ? "" : ", \(size)")"
                 let cells = [
                     accessibilityNode(nextIdentifier: &nextIdentifier,
                                       role: .cell,

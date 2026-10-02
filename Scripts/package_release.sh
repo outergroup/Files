@@ -144,6 +144,7 @@ package_macos_variant() {
         "${macos_app_root}/Contents/MacOS" \
         "${macos_app_root}/Contents/Resources/bundles"
     install_shared_resources "${app_root}"
+    install_shared_resources "${macos_app_root}/Contents/Resources"
     /usr/bin/lipo "${MACOS_BUILD_ROOT}/${CONFIGURATION}/FilesBackend" -thin "${arch}" -output "${macos_app_root}/Contents/MacOS/FilesBackend"
     chmod 0755 "${macos_app_root}/Contents/MacOS/FilesBackend"
     install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-arm.aar" "${macos_app_root}/Contents/Resources/bundles/FilesContent.bundle.macos-arm.aar"

@@ -11,6 +11,32 @@ public enum OuterframeAccessibilityRole: UInt8, Sendable {
     case row = 5
     case cell = 6
     case textField = 7
+    case scrollArea = 8
+}
+
+/// Actions are handled by content against the current node identifier, never stale screen coordinates.
+public enum OuterframeAccessibilityAction: UInt8, Sendable {
+    case press = 0, showMenu, focus, setValue, scrollUp, scrollDown, moveEarlier, moveLater
+}
+
+public struct OuterframeAccessibilityActions: OptionSet, Sendable {
+    public let rawValue: UInt8
+    public init(rawValue: UInt8) { self.rawValue = rawValue }
+    public static let press = Self(rawValue: 1 << 0)
+    public static let showMenu = Self(rawValue: 1 << 1)
+    public static let focus = Self(rawValue: 1 << 2)
+    public static let setValue = Self(rawValue: 1 << 3)
+    public static let scrollUp = Self(rawValue: 1 << 4)
+    public static let scrollDown = Self(rawValue: 1 << 5)
+    public static let moveEarlier = Self(rawValue: 1 << 6)
+    public static let moveLater = Self(rawValue: 1 << 7)
+    public func supports(_ action: OuterframeAccessibilityAction) -> Bool {
+        rawValue & (1 << action.rawValue) != 0
+    }
+}
+
+public enum OuterframeAccessibilitySortDirection: UInt8, Sendable {
+    case none = 0, ascending, descending
 }
 
 /// Represents notifications that the outerframe content can request the host to post.
@@ -40,6 +66,12 @@ public struct OuterframeAccessibilityNode: Sendable {
     /// For table roles: the number of columns
     public var columnCount: Int?
     /// Whether the element is enabled (default true)
+    public var actions: OuterframeAccessibilityActions
+    public var isFocused: Bool
+    public var isSelected: Bool
+    public var rowIndex: Int?
+    public var columnIndex: Int?
+    public var sortDirection: OuterframeAccessibilitySortDirection
     public var isEnabled: Bool
 
     public init(identifier: UInt32,
@@ -51,7 +83,13 @@ public struct OuterframeAccessibilityNode: Sendable {
                 children: [OuterframeAccessibilityNode] = [],
                 rowCount: Int? = nil,
                 columnCount: Int? = nil,
-                isEnabled: Bool = true) {
+                isEnabled: Bool = true,
+                actions: OuterframeAccessibilityActions = [],
+                isFocused: Bool = false,
+                isSelected: Bool = false,
+                rowIndex: Int? = nil,
+                columnIndex: Int? = nil,
+                sortDirection: OuterframeAccessibilitySortDirection = .none) {
         self.identifier = identifier
         self.role = role
         self.frame = frame
@@ -62,6 +100,12 @@ public struct OuterframeAccessibilityNode: Sendable {
         self.rowCount = rowCount
         self.columnCount = columnCount
         self.isEnabled = isEnabled
+        self.actions = actions
+        self.isFocused = isFocused
+        self.isSelected = isSelected
+        self.rowIndex = rowIndex
+        self.columnIndex = columnIndex
+        self.sortDirection = sortDirection
     }
 }
 
@@ -141,6 +185,7 @@ public struct OuterframeAccessibilitySnapshot: Sendable {
 
         var nodes: [OuterframeAccessibilityNode] = []
         var parentIndices: [UInt32] = []
+        var identifiers: Set<UInt32> = []
         nodes.reserveCapacity(nodeCount)
         parentIndices.reserveCapacity(nodeCount)
 
@@ -148,9 +193,11 @@ public struct OuterframeAccessibilitySnapshot: Sendable {
             let offset = nodeRecordsOffset + index * nodeRecordSize
             guard let decoded = decodeNodeRecord(from: data,
                                                  offset: offset,
+                                                 recordSize: nodeRecordSize,
                                                  variableDataOffset: nodeRecordsEnd.partialValue) else {
                 return nil
             }
+            guard identifiers.insert(decoded.node.identifier).inserted else { return nil }
             if decoded.parentIndex != UInt32.max && decoded.parentIndex >= UInt32(index) {
                 return nil
             }
@@ -188,7 +235,7 @@ private struct FlattenedAccessibilityNode {
 private extension OuterframeAccessibilitySnapshot {
     static let formatVersion: UInt32 = 1
     static let headerSize = 16
-    static let nodeRecordSize = 74
+    static let nodeRecordSize = 84
     static let minimumNodeRecordSize: UInt32 = 74
     static let maximumNodeCount = 100_000
 
@@ -236,6 +283,8 @@ private extension OuterframeAccessibilitySnapshot {
         let hintReference = appendStringReference(flattenedNode.node.hint,
                                                   variableDataOffset: variableDataOffset,
                                                   stringData: &stringData)
+        if flattenedNode.node.isSelected { flags |= 1 << 7 }
+        if flattenedNode.node.isFocused { flags |= 1 << 6 }
         if labelReference != nil { flags |= Self.stringLabelFlag }
         if valueReference != nil { flags |= Self.stringValueFlag }
         if hintReference != nil { flags |= Self.stringHintFlag }
@@ -255,6 +304,10 @@ private extension OuterframeAccessibilitySnapshot {
         nodeRecords.appendInt32(Int32(clamping: flattenedNode.node.columnCount ?? 0))
         nodeRecords.appendUInt8(flattenedNode.node.role.rawValue)
         nodeRecords.appendUInt8(flags)
+        nodeRecords.appendUInt8(flattenedNode.node.actions.rawValue)
+        nodeRecords.appendInt32(Int32(clamping: flattenedNode.node.rowIndex ?? -1))
+        nodeRecords.appendInt32(Int32(clamping: flattenedNode.node.columnIndex ?? -1))
+        nodeRecords.appendUInt8(flattenedNode.node.sortDirection.rawValue)
     }
 
     func appendStringReference(_ string: String?,
@@ -273,6 +326,7 @@ private extension OuterframeAccessibilitySnapshot {
 
     static func decodeNodeRecord(from data: Data,
                                  offset: Int,
+                                 recordSize: Int,
                                  variableDataOffset: Int) -> DecodedNodeRecord? {
         guard let identifier = data.readUInt32(at: offset),
               let parentIndex = data.readUInt32(at: offset + 4),
@@ -317,6 +371,10 @@ private extension OuterframeAccessibilitySnapshot {
         if flags & stringValueFlag != 0 && value == nil { return nil }
         if flags & stringHintFlag != 0 && hint == nil { return nil }
 
+        let rowIndex = recordSize >= 79 ? Int(data.readInt32(at: offset + 75) ?? -1) : -1
+        let columnIndex = recordSize >= 83 ? Int(data.readInt32(at: offset + 79) ?? -1) : -1
+        guard rowIndex >= -1, columnIndex >= -1,
+              let sortDirection = OuterframeAccessibilitySortDirection(rawValue: recordSize >= 84 ? (data.readUInt8(at: offset + 83) ?? 0) : 0) else { return nil }
         let node = OuterframeAccessibilityNode(identifier: identifier,
                                                role: role,
                                                frame: CGRect(x: originX, y: originY, width: width, height: height),
@@ -325,7 +383,13 @@ private extension OuterframeAccessibilitySnapshot {
                                                hint: hint,
                                                rowCount: flags & rowCountFlag == 0 ? nil : Int(rowCountRaw),
                                                columnCount: flags & columnCountFlag == 0 ? nil : Int(columnCountRaw),
-                                               isEnabled: flags & enabledFlag != 0)
+                                               isEnabled: flags & enabledFlag != 0,
+                                               actions: .init(rawValue: recordSize > 74 ? (data.readUInt8(at: offset + 74) ?? 0) : 0),
+                                               isFocused: flags & (1 << 6) != 0,
+                                               isSelected: flags & (1 << 7) != 0,
+                                               rowIndex: rowIndex < 0 ? nil : rowIndex,
+                                               columnIndex: columnIndex < 0 ? nil : columnIndex,
+                                               sortDirection: sortDirection)
         return DecodedNodeRecord(node: node, parentIndex: parentIndex)
     }
 

@@ -124,6 +124,7 @@ enum BrowserToContentMessage {
                                       modifierFlags: UInt64)
     case pasteboardAccessResponse(requestID: UUID, granted: Bool, items: [OuterframeContentPasteboardItem])
     case filePromiseWriteRequest(requestID: UUID, promiseID: UUID)
+    case accessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String)
     case accessibilitySnapshotRequest(requestID: UUID)
     case historyEntryAccepted(entryID: UUID, url: String)
     case historyEntryRejected(entryID: UUID, errorMessage: String)
@@ -437,6 +438,13 @@ enum BrowserToContentMessage {
             payload.append(uuid: requestID)
             payload.append(uuid: promiseID)
             return makeBrowserToContentFrame(type: .filePromiseWriteRequest, payload: payload)
+
+        case .accessibilityAction(let identifier, let action, let value):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uint32: identifier)
+            payload.append(uint8: action.rawValue)
+            try payload.append(stringReference: value)
+            return makeBrowserToContentFrame(type: .accessibilityAction, payload: try payload.finalize())
 
         case .accessibilitySnapshotRequest(let requestID):
             var payload = Data(capacity: 16)
@@ -872,6 +880,15 @@ enum BrowserToContentMessage {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
             return .filePromiseWriteRequest(requestID: requestID, promiseID: promiseID)
+
+        case .accessibilityAction:
+            guard let identifier = cursor.readUInt32(),
+                  let rawAction = cursor.readUInt8(),
+                  let action = OuterframeAccessibilityAction(rawValue: rawAction),
+                  let value = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .accessibilityAction(identifier: identifier, action: action, value: value)
 
         case .accessibilitySnapshotRequest:
             guard let requestID = cursor.readUUID() else {
@@ -1705,6 +1722,7 @@ private enum BrowserToContentMessageKind: UInt16 {
     case setCursorPosition = 1025
     case selectionToPasteboardCopyRequest = 1026
     case pasteboardContentPasted = 1027
+    case accessibilityAction = 1043
     case accessibilitySnapshotRequest = 1028
     case historyEntryAccepted = 1029
     case historyEntryRejected = 1030
