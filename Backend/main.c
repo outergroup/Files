@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "HTTPCache.h"
+#include "FileList.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -46,6 +47,7 @@ static const char *kBundleUrlPathMacosX86 = "/bundles/FilesContent/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/FilesContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/FilesContent.bundle.macos-x86.aar";
 
+static bool g_web_only = false;
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_web_root[PATH_MAX] = "";
@@ -523,14 +525,6 @@ static bool sb_append_u16_le(StringBuilder *builder, uint16_t value) {
     return sb_append_n(builder, bytes, sizeof(bytes));
 }
 
-static bool sb_append_u64_le(StringBuilder *builder, uint64_t value) {
-    char bytes[8];
-    for (int i = 0; i < 8; i++) {
-        bytes[i] = (char)((value >> (i * 8)) & 0xffu);
-    }
-    return sb_append_n(builder, bytes, sizeof(bytes));
-}
-
 static bool sb_append_zero(StringBuilder *builder, size_t length) {
     if (!sb_reserve(builder, length)) {
         return false;
@@ -563,10 +557,6 @@ static void write_u32_le_at(char *data, size_t offset, uint32_t value) {
 enum {
     FILE_PATH_REQUEST_BINARY_MAGIC = 0x51465046u,
     FILE_MKDIR_REQUEST_BINARY_MAGIC = 0x51444d46u,
-    FILE_LIST_BINARY_MAGIC = 0x534c4646u,
-    FILE_LIST_BINARY_VERSION = 2,
-    FILE_LIST_BINARY_HEADER_SIZE = 48,
-    FILE_LIST_BINARY_ROW_SIZE = 48,
     FILE_OPENERS_BINARY_MAGIC = 0x504f464fu,
     FILE_OPENERS_REQUEST_BINARY_MAGIC = 0x514f464fu,
     FILE_OPENERS_BINARY_VERSION = 2,
@@ -648,19 +638,6 @@ static bool read_binary_string_ref_view(const unsigned char *data,
     return true;
 }
 
-static bool append_binary_string_ref(StringBuilder *rows,
-                                     StringBuilder *variable,
-                                     const char *text) {
-    size_t offset = variable->length;
-    size_t length = text ? strlen(text) : 0;
-    if (offset > UINT32_MAX || length > UINT32_MAX) {
-        return false;
-    }
-    return sb_append_u32_le(rows, (uint32_t)offset) &&
-           sb_append_u32_le(rows, (uint32_t)length) &&
-           sb_append_n(variable, text ? text : "", length);
-}
-
 static bool append_binary_data_ref(StringBuilder *rows,
                                    StringBuilder *variable,
                                    const unsigned char *data,
@@ -678,15 +655,6 @@ static void patch_string_refs_to_absolute_offsets(char *data, size_t data_len, u
     for (size_t offset = 0; offset + 8 <= data_len; offset += 8) {
         uint32_t relative = read_u32_le_at(data, offset);
         write_u32_le_at(data, offset, relative + variable_offset);
-    }
-}
-
-static void patch_file_list_row_string_refs(char *data, size_t data_len, uint32_t variable_offset) {
-    for (size_t row_offset = 0; row_offset + FILE_LIST_BINARY_ROW_SIZE <= data_len; row_offset += FILE_LIST_BINARY_ROW_SIZE) {
-        for (size_t field_offset = 0; field_offset < 24; field_offset += 8) {
-            uint32_t relative = read_u32_le_at(data, row_offset + field_offset);
-            write_u32_le_at(data, row_offset + field_offset, relative + variable_offset);
-        }
     }
 }
 
@@ -1313,19 +1281,15 @@ static uint32_t requester_access_flags_for_stat(const RequesterAccessContext *co
     return flags;
 }
 
-static bool append_file_list_entry_row(StringBuilder *rows,
-                                       StringBuilder *variable,
-                                       const FileEntry *entry) {
-    char mode[11];
-    mode_string(entry->mode, mode);
-    uint64_t modified_millis = entry->modified > 0 ? (uint64_t)(entry->modified * 1000.0) : 0;
-    return append_binary_string_ref(rows, variable, entry->name) &&
-           append_binary_string_ref(rows, variable, entry->path) &&
-           append_binary_string_ref(rows, variable, mode) &&
-           sb_append_u32_le(rows, entry->is_directory ? 1u : 0u) &&
-           sb_append_u32_le(rows, entry->access_flags) &&
-           sb_append_u64_le(rows, entry->size) &&
-           sb_append_u64_le(rows, modified_millis);
+static void file_list_read_entry(const void *context, size_t index, FileListEntry *out) {
+    const FileEntry *entry = &((const FileEntry *)context)[index];
+    out->name = entry->name;
+    out->path = entry->path;
+    mode_string(entry->mode, out->mode);
+    out->directory = entry->is_directory;
+    out->access = entry->access_flags;
+    out->size = entry->size;
+    out->modified_ms = entry->modified > 0 ? (uint64_t)(entry->modified * 1000.0) : 0;
 }
 
 static uint64_t stat_modified_millis(const struct stat *st) {
@@ -1400,56 +1364,15 @@ static void send_files_response_for_path(int fd, const char *requested, const ch
     char parent[PATH_MAX];
     parent_path_for(path, parent, sizeof(parent));
 
-    StringBuilder header_refs = {0};
-    StringBuilder rows = {0};
-    StringBuilder variable = {0};
-    bool ok = append_binary_string_ref(&header_refs, &variable, path) &&
-              append_binary_string_ref(&header_refs, &variable, parent);
-    for (size_t i = 0; ok && i < count; i++) {
-        ok = append_file_list_entry_row(&rows, &variable, &entries[i]);
-    }
+    size_t length = 0;
+    unsigned char *response = file_list_encode(path, parent, count, entries, file_list_read_entry, &length);
     free(entries);
-
-    size_t variable_offset = FILE_LIST_BINARY_HEADER_SIZE + rows.length;
-    size_t total_size = variable_offset + variable.length;
-    if (ok && (header_refs.length != 16 || rows.length > UINT32_MAX || variable.length > UINT32_MAX ||
-               variable_offset > UINT32_MAX || total_size > UINT32_MAX || count > UINT32_MAX)) {
-        ok = false;
-    }
-    if (!ok) {
-        free(header_refs.data);
-        free(rows.data);
-        free(variable.data);
+    if (!response) {
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-
-    patch_string_refs_to_absolute_offsets(header_refs.data, header_refs.length, (uint32_t)variable_offset);
-    patch_file_list_row_string_refs(rows.data, rows.length, (uint32_t)variable_offset);
-
-    StringBuilder response = {0};
-    ok = sb_append_u32_le(&response, FILE_LIST_BINARY_MAGIC) &&
-         sb_append_u32_le(&response, FILE_LIST_BINARY_VERSION) &&
-         sb_append_u32_le(&response, (uint32_t)count) &&
-         sb_append_u32_le(&response, FILE_LIST_BINARY_ROW_SIZE) &&
-         sb_append_u32_le(&response, FILE_LIST_BINARY_HEADER_SIZE) &&
-         sb_append_u32_le(&response, (uint32_t)variable_offset) &&
-         sb_append_u32_le(&response, (uint32_t)total_size) &&
-         sb_append_u32_le(&response, 0) &&
-         sb_append_n(&response, header_refs.data, header_refs.length) &&
-         sb_append_n(&response, rows.data ? rows.data : "", rows.length) &&
-         sb_append_n(&response, variable.data ? variable.data : "", variable.length);
-    free(header_refs.data);
-    free(rows.data);
-    free(variable.data);
-
-    if (!ok) {
-        free(response.data);
-        send_text_response(fd, 500, "out of memory\n");
-        return;
-    }
-    send_response(fd, 200, "OK", "application/octet-stream", response.data, response.length);
-    free(response.data);
+    send_response(fd, 200, "OK", "application/octet-stream", response, length);
+    free(response);
 }
 
 static void send_files_response(int fd, const char *query, const char *requester_user) {
@@ -1821,10 +1744,13 @@ static void handle_http_request(int fd,
         }
         send_upload_response(fd, query, body, content_length);
         free(body);
-    } else if (strcmp(target, "/") == 0 && !request_accepts_outerframe(request, request_header_length)) {
+    } else if (strcmp(target, "/") == 0 && (g_web_only || !request_accepts_outerframe(request, request_header_length))) {
         free(body);
         send_web_file(fd, "index.html", "text/html; charset=utf-8", request, request_header_length,
                       strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/app-icon.png") == 0 || strcmp(target, "/favicon.ico") == 0) {
+        free(body);
+        send_web_file(fd, "app-icon.png", "image/png", request, request_header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/app.css") == 0) {
         free(body);
         send_web_file(fd, "app.css", "text/css; charset=utf-8", request, request_header_length,
@@ -2187,7 +2113,7 @@ static int create_launchd_unix_listener(const char *socket_name, const char *soc
 #endif
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--web-root DIR] [--icon-file PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--api-socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--web-root DIR] [--web-only] [--icon-file PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2223,6 +2149,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
             snprintf(g_web_root, sizeof(g_web_root), "%s/../web", bundles_dir);
+        } else if (strcmp(argv[i], "--web-only") == 0) {
+            g_web_only = true;
         } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
             snprintf(g_web_root, sizeof(g_web_root), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--icon-file") == 0 && i + 1 < argc) {
