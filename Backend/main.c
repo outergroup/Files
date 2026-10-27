@@ -41,6 +41,8 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #define FILE_TEXT_PREVIEW_MAX_BYTES (256 * 1024)
 #define FILE_MEDIA_PREVIEW_MAX_BYTES (16 * 1024 * 1024)
 
+#include "EnvironmentTools.h"
+
 static const char *kBundleUrlPath = "/bundles/FilesContent";
 static const char *kBundleUrlPathMacosArm = "/bundles/FilesContent/macos-arm";
 static const char *kBundleUrlPathMacosX86 = "/bundles/FilesContent/macos-x86";
@@ -858,6 +860,7 @@ static void opener_owner_name_for_socket_path(const char *socket_path, char *out
 
 static void send_openers_response_for_path(int fd,
                                            const char *requested,
+                                           const char *content_type,
                                            const char *requester_user) {
     char path[PATH_MAX];
     resolve_requested_path(requested, path, sizeof(path));
@@ -867,7 +870,7 @@ static void send_openers_response_for_path(int fd,
     }
 
     StringBuilder api_response = {0};
-    if (!query_file_openers_from_outershelld(path, "", requester_user, &api_response)) {
+    if (!query_file_openers_from_outershelld(path, content_type, requester_user, &api_response)) {
         free(api_response.data);
         send_openers_error_response(fd, 502, "openers unavailable: failed to query outershelld API\n");
         return;
@@ -976,7 +979,9 @@ static void send_openers_response(int fd,
         send_text_response(fd, 400, "missing path\n");
         return;
     }
-    send_openers_response_for_path(fd, requested, requester_user);
+    char content_type[256] = "";
+    query_value(query, "contentType", content_type, sizeof(content_type));
+    send_openers_response_for_path(fd, requested, content_type, requester_user);
 }
 
 static int hex_value(char c) {
@@ -1676,6 +1681,18 @@ static void handle_http_request(int fd,
         query++;
     }
 
+    if (strcmp(target, "/api/environments") == 0) {
+        if (strcasecmp(method, "POST") == 0 && !environment_request_header(request, request_header_length)) {
+            free(body); send_text_response(fd, 403, "Missing environment request header\n"); return;
+        }
+        size_t result_length = 0;
+        char *result = environment_tools_request(method, body, content_length, &result_length);
+        free(body);
+        if (!result) { send_text_response(fd, 503, "Files helper connection failed. Reopen the file to check whether a write completed before retrying.\n"); return; }
+        send_response(fd, 200, "OK", "application/octet-stream", result, result_length);
+        free(result); return;
+    }
+
     char requester_user[256];
     request_header_value(request, "X-Files-User", requester_user, sizeof(requester_user));
 
@@ -1698,7 +1715,7 @@ static void handle_http_request(int fd,
                 send_text_response(fd, 400, "bad openers request\n");
                 return;
             }
-            send_openers_response_for_path(fd, requested, requester_user);
+            send_openers_response_for_path(fd, requested, "", requester_user);
             free(body);
             return;
         }
@@ -1759,6 +1776,8 @@ static void handle_http_request(int fd,
         free(body);
         send_web_file(fd, "app.js", "text/javascript; charset=utf-8", request, request_header_length,
                       strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/environment.js") == 0) {
+        send_web_file(fd, "environment.js", "text/javascript; charset=utf-8", request, request_header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/folder-icon.png") == 0) {
         free(body);
         send_web_file(fd, "folder-icon.png", "image/png", request, request_header_length,

@@ -1,0 +1,7 @@
+*
+!*.c
+!*.h
+!vendor/
+!vendor/*.c
+!vendor/*.h
+!Dockerfile

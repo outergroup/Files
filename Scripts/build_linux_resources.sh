@@ -33,7 +33,7 @@ mkdir -p "${OUTPUT_DIR}"
 
 cc ${BACKEND_CFLAGS} \
     -o "${OUTPUT_DIR}/${BACKEND_EXECUTABLE_NAME}" \
-    "${REPO_ROOT}/${BACKEND_SOURCE}" \
+    "${REPO_ROOT}/${BACKEND_SOURCE}" "${REPO_ROOT}/Backend/Environment.c" \
     ${BACKEND_LDFLAGS}
 
 if command -v strip >/dev/null 2>&1; then

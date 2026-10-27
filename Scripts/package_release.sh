@@ -52,7 +52,7 @@ cc -std=gnu17 -Wall -Wextra -O2 \
     -arch arm64 -arch x86_64 \
     -mmacosx-version-min=14.6 \
     -o "${MACOS_BUILD_ROOT}/${CONFIGURATION}/FilesBackend" \
-    "${REPO_ROOT}/Backend/main.c"
+    "${REPO_ROOT}/Backend/main.c" "${REPO_ROOT}/Backend/Environment.c" -lpthread -lm
 
 require_file "${MACOS_BUILD_ROOT}/${CONFIGURATION}/FilesBackend"
 
@@ -91,6 +91,7 @@ install_shared_resources() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/web/app-icon.png"
     install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/app.css" "${app_root}/web/app.css"
     install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/app.js" "${app_root}/web/app.js"
+    install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/environment.js" "${app_root}/web/environment.js"
     install -m 0644 "${REPO_ROOT}/Resources/FilesWeb/folder-icon.png" "${app_root}/web/folder-icon.png"
 }
 

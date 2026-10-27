@@ -197,7 +197,7 @@ cmd_build_frontend() {
         "${STAGE_ROOT}/bundles" \
         "${BUNDLE_ARCHIVE_STEM}"
     install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
-    install -m 0644 "${ROOT}/Resources/FilesWeb/index.html" "${ROOT}/Resources/FilesWeb/app.css" "${ROOT}/Resources/FilesWeb/app.js" "${ROOT}/Resources/FilesWeb/folder-icon.png" "${STAGE_ROOT}/web/"
+    install -m 0644 "${ROOT}/Resources/FilesWeb/index.html" "${ROOT}/Resources/FilesWeb/app.css" "${ROOT}/Resources/FilesWeb/app.js" "${ROOT}/Resources/FilesWeb/environment.js" "${ROOT}/Resources/FilesWeb/folder-icon.png" "${STAGE_ROOT}/web/"
 }
 
 backend_directory() {
@@ -239,6 +239,7 @@ build_backend_in_container() {
         container run --rm --platform "${platform}" \
             --network "${network}" \
             --mount "type=bind,source=${ROOT}/Backend,target=/src/Backend,readonly" \
+            --mount "type=bind,source=${ROOT}/Helper,target=/src/Helper,readonly" \
             --mount "type=bind,source=${output_dir},target=/out" \
             --env CC=gcc \
             --env "BACKEND_SOURCE=${BACKEND_SOURCE}" \
@@ -246,11 +247,12 @@ build_backend_in_container() {
             --env "BACKEND_CFLAGS=${BACKEND_CFLAGS}" \
             --env "BACKEND_LDFLAGS=${BACKEND_LDFLAGS}" \
             "${image}" \
-            bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
+            bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" /src/Backend/Environment.c $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
     else
         docker run --rm --platform "${platform}" \
             --network none \
             --mount "type=bind,source=${ROOT}/Backend,target=/src/Backend,readonly" \
+            --mount "type=bind,source=${ROOT}/Helper,target=/src/Helper,readonly" \
             --mount "type=bind,source=${output_dir},target=/out" \
             --env CC=gcc \
             --env "BACKEND_SOURCE=${BACKEND_SOURCE}" \
@@ -258,7 +260,7 @@ build_backend_in_container() {
             --env "BACKEND_CFLAGS=${BACKEND_CFLAGS}" \
             --env "BACKEND_LDFLAGS=${BACKEND_LDFLAGS}" \
             "${image}" \
-            bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
+            bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" /src/Backend/Environment.c $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
     fi
 }
 
@@ -266,13 +268,13 @@ build_backend_on_target() {
     local output_dir remote_build=".cache/outershell-app-build/${APP_ID}"
     output_dir="$(backend_directory "${STAGE_ROOT}" "${TARGET_LIBC}" "${TARGET_ARCH}")"
     echo "==> No build container runtime is available; building ${BACKEND_EXECUTABLE_NAME} on the ${TARGET_LIBC} target"
-    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend | run_ssh "
+    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend Helper | run_ssh "
         set -e
         rm -rf \"\$HOME/${remote_build}\"
         mkdir -p \"\$HOME/${remote_build}\"
         tar xzf - -C \"\$HOME/${remote_build}\"
         cc ${BACKEND_CFLAGS} -o \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\" \
-            \"\$HOME/${remote_build}/${BACKEND_SOURCE}\" ${BACKEND_LDFLAGS}
+            \"\$HOME/${remote_build}/${BACKEND_SOURCE}\" \"\$HOME/${remote_build}/Backend/Environment.c\" ${BACKEND_LDFLAGS}
         if command -v strip >/dev/null 2>&1; then
             strip --strip-unneeded \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\"
         fi

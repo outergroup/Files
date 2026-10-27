@@ -43,7 +43,10 @@ echo "==> Archiving FilesContent bundles"
 echo "==> Building FilesBackend"
 cc -std=gnu17 -Wall -Wextra -O2 \
     -o "${BUILD_ROOT}/${CONFIGURATION}/FilesBackend" \
-    "${SCRIPT_DIR}/Backend/main.c"
+    "${SCRIPT_DIR}/Backend/main.c" "${SCRIPT_DIR}/Backend/Environment.c" -lpthread -lm
+
+mkdir -p "${RUN_ROOT}/web"
+cp -R "${SCRIPT_DIR}/Resources/FilesWeb/." "${RUN_ROOT}/web/"
 
 echo "Built:"
 echo "  ${BUILD_ROOT}/${CONFIGURATION}/FilesBackend"
