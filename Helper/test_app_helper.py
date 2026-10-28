@@ -3,9 +3,13 @@ import hashlib, http.client, os, pathlib, signal, socket, struct, subprocess, sy
 from test_registry_server import RegistryServer, encode
 APP = 'Files'
 PREFIX = 'FL'
-CAPS = 3
+CAPS = 515
 HELPER = str(pathlib.Path(sys.argv[1]).resolve())
 BACKEND = str(pathlib.Path(sys.argv[2]).resolve())
+PROVIDER = sys.argv[3] if len(sys.argv)>3 else 'docker'
+assert PROVIDER in ('docker','apple.container','wslc')
+RUNTIME_KEY = 'apple' if PROVIDER=='apple.container' else PROVIDER
+EXECUTABLE = {'docker':'docker','apple.container':'container','wslc':'wslc.exe'}[PROVIDER]
 
 def exact(stream, n):
  data = b''
@@ -50,12 +54,12 @@ def gone(pids):
 with tempfile.TemporaryDirectory(prefix='app-helper-',dir='/tmp') as temp:
  root=pathlib.Path(temp);web=root/'web';web.mkdir()
  (web/'environment.js').write_text('test')
- target='a'*64;row=['test','Container','docker',target,'running','test','','','registered-name']
+ target='a'*64;row=['test','Container',PROVIDER,target,'running','test','','','registered-name']
  registry=RegistryServer(root/'registry.sock',lambda:encode([row]))
- runtime=root/'docker';runtime.write_text('#!'+sys.executable+'\n'+'''import os,sys,pathlib
+ runtime=root/EXECUTABLE;runtime.write_text('#!'+sys.executable+'\n'+'''import os,sys,pathlib
 args=sys.argv[1:]
 if args[:1]==['--host']:args=args[2:]
-assert args[:2]==['exec','-i'],args
+assert args[:2] in (['exec','-i'],['exec','--interactive']),args
 args=args[2:]
 if args[:1]==['--user']:args=args[2:]
 assert args[1:] == ['/usr/local/bin/outer-APP_LOWER-helper','serve'],args
@@ -101,8 +105,9 @@ os.execv(os.environ['TEST_HELPER'],[os.environ['TEST_HELPER'],'serve'])
   assert subprocess.run([HELPER,'host'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==2
   start()
   op='list' if APP=='Files' else 'read'
-  fields=dict(target='docker:'+target,path=str(root if APP=='Files' else file))
+  fields=dict(target=RUNTIME_KEY+':'+target,path=str(root if APP=='Files' else file))
   for _ in range(3):result=call(op,**fields)
+  assert registry.requests.count(b'\x02\0\0\0\x22\0')==1,registry.requests
   assert len(pids())==1,pids();assert alive(pids()[0])
   assert int(subprocess.check_output(['ps','-o','ppid=','-p',str(pids()[0])]))==process.pid
   first=pids()[0];os.kill(first,signal.SIGKILL)
@@ -118,8 +123,16 @@ os.execv(os.environ['TEST_HELPER'],[os.environ['TEST_HELPER'],'serve'])
    assert len(pids())==2
   if APP!='Top':
    row[3]='b'*64
+   call('targets')
    assert 'error' in call(op,**fields)
    gone([pids()[-1]])
+   row[3]=target;call(op,**fields)
+   row[3]='c'*64
+   os.kill(pids()[-1],signal.SIGKILL)
+   time.sleep(.05)
+   before=len(pids())
+   assert 'error' in call(op,**fields)
+   assert len(pids())==before
    row[3]=target;call(op,**fields)
   active=pids()[-1]
   process.terminate();process.wait(timeout=5);process.stderr.close();gone(pids())

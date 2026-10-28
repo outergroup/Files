@@ -55,6 +55,7 @@ static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_web_root[PATH_MAX] = "";
 static char g_backend_label[256] = "org.outershell.Files";
 static char g_outershelld_api_socket_path[PATH_MAX] = "";
+static bool g_explicit_api_socket_path = false;
 static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
@@ -661,35 +662,7 @@ static void patch_string_refs_to_absolute_offsets(char *data, size_t data_len, u
 }
 
 static void default_outershelld_api_socket_path(char *out, size_t out_size) {
-    const char *env_path = getenv("OUTERSHELLD_API_SOCKET");
-    if (env_path && env_path[0]) {
-        snprintf(out, out_size, "%s", env_path);
-        return;
-    }
-#ifdef __APPLE__
-    if (geteuid() == 0) {
-        snprintf(out, out_size, "/var/run/outershelld-api");
-        return;
-    }
-    const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
-    if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
-    if (tmp && tmp[0]) {
-        snprintf(out, out_size, "%s%soutershelld-api", tmp, tmp[strlen(tmp) - 1] == '/' ? "" : "/");
-        return;
-    }
-    snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
-#else
-    if (geteuid() == 0) {
-        snprintf(out, out_size, "/run/outershelld-api");
-        return;
-    }
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (runtime && runtime[0]) {
-        snprintf(out, out_size, "%s/outershelld-api", runtime);
-        return;
-    }
-    snprintf(out, out_size, "/run/user/%d/outershelld-api", (int)getuid());
-#endif
+    environment_registry_socket(out, out_size);
 }
 
 static bool write_exact_fd(int fd, const void *data, size_t length) {
@@ -723,14 +696,17 @@ static bool read_exact_fd(int fd, void *data, size_t length) {
 }
 
 static int connect_outershelld_api_socket(void) {
-    if (!g_outershelld_api_socket_path[0]) return -1;
-    if (strlen(g_outershelld_api_socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
+    char path[PATH_MAX];
+    if (g_explicit_api_socket_path) snprintf(path, sizeof(path), "%s", g_outershelld_api_socket_path);
+    else environment_registry_socket(path, sizeof(path));
+    if (!path[0]) return -1;
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    snprintf(address.sun_path, sizeof(address.sun_path), "%s", g_outershelld_api_socket_path);
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
         close(fd);
         return -1;
@@ -846,6 +822,16 @@ static void opener_owner_name_for_socket_path(const char *socket_path, char *out
     if (!out || out_size == 0) return;
     out[0] = '\0';
     if (!socket_path || !socket_path[0]) return;
+#ifdef __APPLE__
+    if (!strncmp(socket_path, "/launchd/system/", sizeof("/launchd/system/") - 1)) {
+        snprintf(out, out_size, "root");
+        return;
+    }
+    if (!strncmp(socket_path, "/launchd/user/", sizeof("/launchd/user/") - 1)) {
+        snprintf(out, out_size, "User");
+        return;
+    }
+#endif
 
     struct stat st;
     if (stat(socket_path, &st) != 0) return;
@@ -2163,6 +2149,7 @@ int main(int argc, char **argv) {
 #endif
         } else if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_outershelld_api_socket_path, sizeof(g_outershelld_api_socket_path));
+            g_explicit_api_socket_path = true;
         } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {

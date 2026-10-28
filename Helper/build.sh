@@ -11,8 +11,21 @@ case "$os/$arch" in darwin/arm64|darwin/amd64|linux/arm64|linux/amd64) ;; *) ech
 if [ "$os" = linux ] && [ -z "${CC:-}" ]; then
     temporary=$(mktemp -d)
     trap 'rm -rf "$temporary"' EXIT HUP INT TERM
-    docker build --platform "linux/$arch" --output "type=local,dest=$temporary" "$root"
-    install -m 755 "$temporary/outer-files-helper" "$output"
+    runtime=${OUTER_BUILD_CONTAINER_RUNTIME:-auto}
+    if [ "$runtime" = auto ]; then
+        if command -v container >/dev/null 2>&1 && container system status >/dev/null 2>&1; then
+            runtime=container
+        else
+            runtime=docker
+        fi
+    fi
+    case "$runtime" in container|docker) ;; *) echo "Expected OUTER_BUILD_CONTAINER_RUNTIME=container or docker" >&2; exit 1;; esac
+    "$runtime" build --platform "linux/$arch" --output "type=local,dest=$temporary" "$root"
+    helper="$temporary/outer-files-helper"
+    if [ ! -f "$helper" ] && [ "$runtime" = container ]; then
+        helper="$temporary/out.tar/linux_$arch/outer-files-helper"
+    fi
+    install -m 755 "$helper" "$output"
     exit
 fi
 set --

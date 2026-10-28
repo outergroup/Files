@@ -1,7 +1,7 @@
 const EnvironmentBinary = (() => {
     'use strict';
     const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', {fatal:true});
-    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9};
+    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, places:10};
     function encode(operation, values = {}) {
         const op = operations[operation];
         if (!op) throw Error('Unsupported environment operation');
@@ -72,11 +72,11 @@ const EnvironmentBinary = (() => {
         const expected = operation === 'preview' ? 2 : operation === 'draft' ? 3 : operations[operation];
         if (!expected || m.u32(0) !== 0x53484c46 || m.u32(4) !== 2 || m.u32(8) !== expected ||
             m.u32(12) !== 0 || m.u32(16) !== metadata.byteLength || m.u32(28) !== 64 || m.u32(36) ||
-            m.u64(40) !== body.byteLength || stride !== (operation === 'list' ? 48 : 0) ||
+            m.u64(40) !== body.byteLength || stride !== ((operation === 'list' || operation === 'places') ? 48 : 0) ||
             (!stride && count) || variable !== 64 + count * stride || variable > metadata.byteLength ||
             (expected !== 2 && body.byteLength)) throw Error('Invalid environment metadata');
         const result = {ok:true, path:m.string(48, variable)};
-        if (operation === 'list') {
+        if ((operation === 'list' || operation === 'places')) {
             result.parent = m.string(56, variable);
             result.entries = Array.from({length:count}, (_, i) => {
                 const o = 64 + i * stride;

@@ -54,7 +54,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         get_u32(input.data + 4) != 1 || get_u32(input.data + 8) != input.size ||
         get_u64(input.data + 16)) { fail("invalid environment request header"); goto done; }
     operation = get_u32(input.data + 12);
-    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == CLIENT_PREVIEW;
+    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_PLACES || operation == CLIENT_PREVIEW;
     if (!allowed) { fail("operation is not supported by this app"); goto done; }
     target = binary_read_string(input, 24, CLIENT_HEADER, 4096);
     user = binary_read_string(input, 32, CLIENT_HEADER, 256);
@@ -74,9 +74,8 @@ Bytes dispatch_binary(Bytes input, const char *method) {
     body = (Bytes){input.data + offset, length};
     if (!utf8(body.data, body.size)) { fail("document is not UTF-8 text"); goto done; }
     if (operation == CLIENT_TARGETS) {
-        EnvironmentSnapshot environments = discover_environments();
-        snapshot = environment_snapshot_encode(&environments);
-        environment_snapshot_free(&environments);
+        const EnvironmentSnapshot *environments = environment_registry(true);
+        snapshot = environment_snapshot_encode(environments);
         goto done;
     }
     request.operation = operation == CLIENT_PREVIEW ? OP_READ : operation;

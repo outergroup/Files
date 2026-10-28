@@ -14,3 +14,12 @@
 @media(max-height:600px) and (orientation:landscape){.app{grid-template-columns:minmax(0,1fr)}.toolbar,.crumbs,.workspace{grid-column:1;grid-row:auto}}
 
 .location-picker{position:relative;display:flex;align-items:center;gap:6px;flex:0 1 auto;min-width:70px;max-width:40%;padding:6px 8px;border-radius:7px;color:var(--text);font-weight:600;cursor:pointer}.location-picker:hover{background:var(--alt)}.location-picker:focus-within{outline:2px solid var(--accent);outline-offset:1px}#environment-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.location-picker select{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}.path-crumbs{display:flex;align-items:center;gap:6px;min-width:0;overflow:auto;white-space:nowrap}.path-crumbs .crumb,.path-crumbs .separator{flex-shrink:0}.crumbs{min-height:44px}.location-picker>span:last-of-type{font-size:12px}
+
+.app{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto minmax(0,1fr)}
+.crumbs,.places,.workspace{grid-column:1;grid-row:auto}
+.places{display:flex;align-items:center;gap:6px;overflow-x:auto;min-width:0;padding:0 22px 10px;white-space:nowrap}
+.place{flex:none;border:0;border-radius:6px;padding:6px 10px;background:transparent;color:var(--muted);font:inherit;font-size:13px;cursor:pointer}
+.place:hover{background:var(--alt);color:var(--text)}
+.place.selected{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent)}
+.place:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+@media(max-width:900px),(max-height:600px){.places{padding:0 10px 6px;gap:3px}.place{padding:6px 8px;font-size:12px}}

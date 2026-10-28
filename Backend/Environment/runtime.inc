@@ -1,3 +1,88 @@
+#include "RuntimeCommand.h"
+#ifdef __APPLE__
+static Bytes registry_command(char *const *args, double timeout) {
+    Bytes b = {0};
+    Child c;
+    if (!spawn(args, &c))
+        return b;
+    close_fd(&c.input);
+    double until = now() + timeout;
+    if (deadline && until > deadline)
+        until = deadline;
+    bool ok = true;
+    unsigned char block[8192];
+    for (;;) {
+        double remaining = until - now();
+        if (remaining <= 0) {
+            fail("launchctl timed out");
+            ok = false;
+            break;
+        }
+        struct pollfd p = {c.output, POLLIN, 0};
+        int n = poll(&p, 1, (int)(remaining * 1000) + 1);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            fail("launchctl timed out");
+            ok = false;
+            break;
+        }
+        ssize_t got = read(c.output, block, sizeof(block));
+        if (got < 0 && (errno == EAGAIN || errno == EINTR))
+            continue;
+        if (got < 0) {
+            fail("runtime read: %s", strerror(errno));
+            ok = false;
+            break;
+        }
+        if (!got)
+            break;
+        if (!append(&b, block, (size_t)got, MAX_DATA)) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) {
+        int status = 0;
+        for (;;) {
+            pid_t r = waitpid(c.pid, &status, WNOHANG);
+            if (r == c.pid) {
+                c.pid = -1;
+                if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+                    char err[4097] = {0};
+                    lseek(c.error, 0, SEEK_SET);
+                    ssize_t n = read(c.error, err, sizeof(err) - 1);
+                    if (n < 0)
+                        n = 0;
+                    err[n] = 0;
+                    fail("launchctl failed: %s", err);
+                    ok = false;
+                }
+                break;
+            }
+            if (r < 0 && errno != EINTR) {
+                fail("waitpid: %s", strerror(errno));
+                ok = false;
+                break;
+            }
+            if (now() >= until) {
+                fail("launchctl timed out");
+                ok = false;
+                break;
+            }
+            struct timespec pause = {0, 1000000};
+            nanosleep(&pause, NULL);
+        }
+    }
+    child_close(&c);
+    if (!ok)
+        bytes_free(&b);
+    else if (!b.data)
+        append(&b, "", 0, MAX_DATA);
+    return b;
+}
+#endif
+
 #include "environment.h"
 #include <glob.h>
 #include <sys/socket.h>
@@ -134,8 +219,9 @@ static bool registry_targets(EnvironmentSnapshot *snapshot, Bytes bytes, uid_t u
             f[j] = binary_read_string(bytes, 48 + i * 72 + j * 8, variable, 4096);
         if (!failure[0]) {
             const char *kind = !strcmp(f[2], "apple.container") ? "apple" : f[2];
-            bool docker = !strcmp(kind, "docker");
-            bool supported = docker || !strcmp(kind, "apple") || !strcmp(kind, "wslc");
+            AppRuntime provider = app_runtime(kind);
+            bool docker = provider == APP_RUNTIME_DOCKER;
+            bool supported = provider != APP_RUNTIME_UNKNOWN;
             if (!valid_identifier(f[0], 256, false) || (*f[3] && !valid_identifier(f[3], 256, false)))
                 fail("invalid registered container identity");
             else if (!supported)
@@ -147,18 +233,34 @@ static bool registry_targets(EnvironmentSnapshot *snapshot, Bytes bytes, uid_t u
                         ? (geteuid() == 0 ? format("docker-user-%u", (unsigned)uid) : strdup("docker-user"))
                         : strdup(kind);
                 free(rootless);
-                char *exe = find_executable(docker                   ? "docker"
-                                            : !strcmp(kind, "apple") ? "container"
-                                                                     : "wslc");
+                char *exe = find_executable(app_runtime_executable(provider, 0));
+                if (!exe && provider == APP_RUNTIME_WSLC) exe = find_executable("wslc.exe");
                 if (geteuid() == 0 && uid != 0) {
+#ifdef __APPLE__
+                    struct passwd *owner = getpwuid(uid);
+                    struct stat socket_info;
+                    const char *socket_path = !strncmp(f[6], "unix://", 7) ? f[6] + 7 : "";
+                    bool user_socket = owner && *socket_path &&
+                        !strncmp(socket_path, owner->pw_dir, strlen(owner->pw_dir)) &&
+                        socket_path[strlen(owner->pw_dir)] == '/' &&
+                        !stat(socket_path, &socket_info) && S_ISSOCK(socket_info.st_mode) && socket_info.st_uid == uid;
+                    if (provider == APP_RUNTIME_APPLE && owner) {
+                        free(key); key = format("apple-user-%u", (unsigned)uid);
+                    } else {
+                        if (!docker || !user_socket) {
+                            error_add(snapshot, f[1], "Cross-user execution requires Apple Container or that user's local Docker socket");
+                            free(exe); exe = NULL;
+                        }
+                        free(key); key = format("docker-user-%u", (unsigned)uid);
+                    }
+#else
                     char *expected = format("unix:///run/user/%u/docker.sock", (unsigned)uid);
                     if (!docker || strcmp(f[6], expected)) {
-                        error_add(snapshot, f[1],
-                                  "Cross-user execution requires that user's rootless Docker socket");
-                        free(exe);
-                        exe = NULL;
+                        error_add(snapshot, f[1], "Cross-user execution requires that user's rootless Docker socket");
+                        free(exe); exe = NULL;
                     }
                     free(expected);
+#endif
                 }
                 EnvironmentTarget t = {.id = *f[3] ? format("%s:%s", key, f[3])
                                                    : format("registered-%u:%s", (unsigned)uid, f[0]),
@@ -169,7 +271,8 @@ static bool registry_targets(EnvironmentSnapshot *snapshot, Bytes bytes, uid_t u
                                        .image = strdup(f[5]),
                                        .user = strdup(""),
                                        .executable = exe,
-                                       .socket = strdup(docker ? f[6] : "")};
+                                       .socket = strdup(docker ? f[6] : ""),
+                                       .owner_uid = uid};
                 if (*f[7])
                     error_add(snapshot, t.name, f[7]);
                 if (!exe)
@@ -210,6 +313,26 @@ static void discover_registry(EnvironmentSnapshot *result, const char *path, uid
     failure[0] = 0;
 }
 static void sessions_prune(const EnvironmentSnapshot *snapshot);
+static void resolve_registry_socket(char *path, size_t path_size) {
+    outer_shell_default_api_socket_path(path, path_size);
+#ifdef __APPLE__
+    const char *explicit_socket = getenv("OUTERSHELLD_API_SOCKET");
+    if (geteuid() != 0 && (!explicit_socket || !*explicit_socket ||
+                         strstr(path, "/com.apple.launchd."))) {
+        char *args[] = {"/bin/launchctl", "getenv", "OUTERSHELL_API_SOCKET_org.outershell.OuterShell", NULL};
+        Bytes current = registry_command(args, 3);
+        if (current.data && current.size < path_size) {
+            char resolved[PATH_MAX];
+            memcpy(resolved, current.data, current.size); resolved[current.size] = 0;
+            resolved[strcspn(resolved, "\r\n")] = 0;
+            struct stat info;
+            if (!lstat(resolved, &info) && S_ISSOCK(info.st_mode) && info.st_uid == geteuid())
+                snprintf(path, path_size, "%s", resolved);
+        }
+        bytes_free(&current); failure[0] = 0;
+    }
+#endif
+}
 EnvironmentSnapshot discover_environments(void) {
     EnvironmentSnapshot result = {0};
     char hostname[256];
@@ -227,8 +350,40 @@ EnvironmentSnapshot discover_environments(void) {
                                             .image = strdup(""),
                                             .user = strdup(pw ? pw->pw_name : uid)});
     char path[PATH_MAX];
-    outer_shell_default_api_socket_path(path, sizeof(path));
+    resolve_registry_socket(path, sizeof(path));
+#ifdef __APPLE__
+    const char *explicit_socket = getenv("OUTERSHELLD_API_SOCKET");
+#endif
+#ifdef __APPLE__
+    if (geteuid() != 0 || (explicit_socket && *explicit_socket && strcmp(path, "/var/run/outershelld-api")))
+        discover_registry(&result, path, geteuid());
+#else
     discover_registry(&result, path, geteuid());
+#endif
+#ifdef __APPLE__
+    if (geteuid() == 0) {
+        glob_t paths = {0};
+        if (!glob("/var/run/com.apple.launchd.*/API", 0, NULL, &paths)) {
+            for (size_t i = 0; i < paths.gl_pathc; i++) {
+                struct stat info;
+                if (lstat(paths.gl_pathv[i], &info) || !S_ISSOCK(info.st_mode) || info.st_uid == 0) continue;
+                char uid_string[32]; snprintf(uid_string, sizeof(uid_string), "%u", (unsigned)info.st_uid);
+                char *args[] = {"/bin/launchctl", "asuser", uid_string, "/bin/launchctl", "getenv",
+                                "OUTERSHELL_API_SOCKET_org.outershell.OuterShell", NULL};
+                Bytes current = registry_command(args, 3);
+                if (current.data && current.size < PATH_MAX) {
+                    char resolved[PATH_MAX];
+                    memcpy(resolved, current.data, current.size); resolved[current.size] = 0;
+                    resolved[strcspn(resolved, "\r\n")] = 0;
+                    failure[0] = 0;
+                    if (!strcmp(resolved, paths.gl_pathv[i])) discover_registry(&result, resolved, info.st_uid);
+                }
+                bytes_free(&current); failure[0] = 0;
+            }
+        }
+        globfree(&paths);
+    }
+#endif
 #ifdef __linux__
     char system_path[PATH_MAX];
     outer_shell_default_system_api_socket_path(system_path, sizeof(system_path));
@@ -249,6 +404,16 @@ EnvironmentSnapshot discover_environments(void) {
     sessions_prune(&result);
     return result;
 }
+static EnvironmentSnapshot registry_cache;
+static double registry_cache_time;
+static const EnvironmentSnapshot *environment_registry(bool refresh) {
+    if (refresh || !registry_cache_time || now() - registry_cache_time >= 30) {
+        environment_snapshot_free(&registry_cache);
+        registry_cache = discover_environments();
+        registry_cache_time = now();
+    }
+    return &registry_cache;
+}
 typedef struct {
     char *key, *target_id;
     Child child;
@@ -264,6 +429,8 @@ static void session_close(HelperSession *session) {
     *session = (HelperSession){0};
 }
 void sessions_close(void) {
+    environment_snapshot_free(&registry_cache);
+    registry_cache_time = 0;
     for (size_t i = 0; i < 32; i++) {
         if (sessions[i].key && sessions[i].child.input >= 0) { close(sessions[i].child.input); sessions[i].child.input = -1; }
     }
@@ -285,13 +452,13 @@ static bool session_alive(HelperSession *session) {
     return session->child.pid > 0 && poll(&p, 1, 0) == 0;
 }
 static BinaryReply target_operation(const EnvironmentTarget *target, const char *user, const Request *request,
-                                    Bytes body) {
+                                    Bytes body, bool *connection_failed) {
     BinaryReply reply = {0};
     if (strcmp(target->state, "running") || !target->executable || !*target->container) {
         fail("The registered container is not running or its runtime is unavailable."); return reply;
     }
     if (*user && !valid_identifier(user, 128, true)) { fail("invalid container user"); return reply; }
-    char *key = format("%zu:%s%zu:%s%zu:%s%zu:%s", strlen(target->executable), target->executable,
+    char *key = format("%zu:%s%zu:%s%zu:%s%zu:%s%zu:%s", strlen(target->id), target->id, strlen(target->executable), target->executable,
                        strlen(target->socket ? target->socket : ""), target->socket ? target->socket : "",
                        strlen(target->container), target->container, strlen(user), user);
     pthread_mutex_lock(&session_mutex);
@@ -307,16 +474,29 @@ static BinaryReply target_operation(const EnvironmentTarget *target, const char 
             session_close(session);
         }
     }
-    bool safe_retry = request->operation == OP_LIST || request->operation == OP_READ || request->operation == OP_PROCESSES;
-    for (int attempt = 0; attempt < (safe_retry ? 2 : 1); attempt++) {
+    for (int attempt = 0; attempt < 1; attempt++) {
         if (!session->key) {
-            char *args[16]; size_t n = 0;
-            args[n++] = target->executable;
-            if (target->socket && *target->socket) { args[n++] = "--host"; args[n++] = target->socket; }
-            args[n++] = "exec"; args[n++] = "-i";
-            if (*user) { args[n++] = "--user"; args[n++] = (char *)user; }
-            args[n++] = target->container; args[n++] = HELPER_PATH; args[n++] = "serve"; args[n] = NULL;
-            if (!spawn(args, &session->child)) break;
+            char *args[16];
+            if (!app_runtime_exec(app_runtime(target->runtime), target->executable,
+                                  target->socket, user, target->container, HELPER_PATH, args, 16)) {
+                fail("Unsupported container runtime execution configuration.");
+                break;
+            }
+            char **command_args = args;
+#ifdef __APPLE__
+            char *owner_args[24], owner_id[32], owner_user[32];
+            if (geteuid() == 0 && target->owner_uid != 0 && app_runtime(target->runtime) == APP_RUNTIME_APPLE) {
+                snprintf(owner_id, sizeof(owner_id), "%u", (unsigned)target->owner_uid);
+                snprintf(owner_user, sizeof(owner_user), "#%u", (unsigned)target->owner_uid);
+                char *prefix[] = {"/bin/launchctl", "asuser", owner_id, "/usr/bin/sudo", "-n", "-H", "-u", owner_user, "--"};
+                size_t n = sizeof(prefix) / sizeof(*prefix);
+                memcpy(owner_args, prefix, sizeof(prefix));
+                for (size_t i = 0; args[i]; i++) owner_args[n++] = args[i];
+                owner_args[n] = NULL;
+                command_args = owner_args;
+            }
+#endif
+            if (!spawn(command_args, &session->child)) { *connection_failed = true; break; }
             session->key = strdup(key); session->target_id = strdup(target->id); session->next_id = 1;
             uint32_t kind = 0, id = 0; Bytes hello = {0}; bool eof;
             bool ok = frame_read(session->child.output, &kind, &id, &hello, &eof) && kind == 1 && id == 0 &&
@@ -324,8 +504,8 @@ static BinaryReply target_operation(const EnvironmentTarget *target, const char 
                       get_u32(hello.data + 8) == MAX_DATA && get_u32(hello.data + 12) == MAX_FRAME;
             bytes_free(&hello);
             if (!ok) {
-                fail("Container helper unavailable or incompatible; install " HELPER_NAME " in the Dockerfile.");
-                session_close(session); break;
+                fail("Container helper unavailable or incompatible; install " HELPER_NAME " in the container image.");
+                *connection_failed = true; session_close(session); break;
             }
         }
         Request typed = *request; typed.data_length = body.size;
@@ -344,10 +524,8 @@ static BinaryReply target_operation(const EnvironmentTarget *target, const char 
         }
         binary_reply_free(&reply);
         session_close(session);
-        if (!safe_retry) {
-            fail("Container connection lost. The operation may have completed; check its result before retrying."); break;
-        }
-        if (!attempt) failure[0] = 0;
+        *connection_failed = true;
+
     }
     pthread_mutex_unlock(&session_mutex);
     free(key);
@@ -369,18 +547,25 @@ BinaryReply environment_binary_operation(const char *target, const char *user, c
         fail("invalid environment");
         return (BinaryReply){0};
     }
-    EnvironmentSnapshot snapshot = discover_environments();
+    bool live = false;
+    for (size_t i = 0; i < 32; i++)
+        if (sessions[i].key && !strcmp(sessions[i].target_id, target) && session_alive(&sessions[i])) live = true;
+    const EnvironmentSnapshot *snapshot = environment_registry(!live);
     BinaryReply reply = {0};
-    bool found = false;
-    for (size_t i = 1; i < snapshot.target_count; i++) {
-        if (!strcmp(snapshot.targets[i].id, target)) {
-            found = true;
-            reply = target_operation(&snapshot.targets[i], user, request, body);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const EnvironmentTarget *selected = NULL;
+        for (size_t i = 1; i < snapshot->target_count; i++)
+            if (!strcmp(snapshot->targets[i].id, target)) { selected = &snapshot->targets[i]; break; }
+        if (!selected) {
+            fail("The container is no longer registered or was replaced. Refresh the container selection.");
             break;
         }
+        bool connection_failed = false;
+        reply = target_operation(selected, user, request, body, &connection_failed);
+        if (!connection_failed || attempt) break;
+        binary_reply_free(&reply);
+        failure[0] = 0;
+        snapshot = environment_registry(true);
     }
-    if (!found)
-        fail("The container is no longer registered or was replaced. Refresh the container selection.");
-    environment_snapshot_free(&snapshot);
     return reply;
 }

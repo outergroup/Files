@@ -4,6 +4,7 @@
 typedef struct {
     char *id, *runtime, *container, *name, *state, *image, *user;
     char *executable, *socket;
+    uid_t owner_uid;
 } EnvironmentTarget;
 typedef struct {
     char *runtime, *message;

@@ -69,7 +69,7 @@ bool request_decode(Bytes b, Request *r) {
     r->pid = get_u32(b.data + 24);
     r->signal = get_u32(b.data + 28);
     r->limit = get_u64(b.data + 32);
-    if (r->operation < OP_LIST || r->operation > OP_SIGNAL ||
+    if (r->operation < OP_LIST || (r->operation > OP_SIGNAL && r->operation != OP_PLACES) ||
         !(HELPER_CAPABILITIES & (1u << (r->operation - 1))) || r->data_length > MAX_DATA) {
         fail("invalid request operation or body size");
         return false;
@@ -135,7 +135,7 @@ bool response_validate(BinaryReply r, uint32_t op) {
     uint32_t status = get_u32(b.data + 12), count = get_u32(b.data + 20), size = get_u32(b.data + 24),
              offset = get_u32(b.data + 28), variable = get_u32(b.data + 32);
     uint32_t expected = status               ? 0
-                        : op == OP_LIST      ? FILE_ROW_SIZE
+                        : (op == OP_LIST || op == OP_PLACES) ? FILE_ROW_SIZE
                         : op == OP_PROCESSES ? PROCESS_ROW_SIZE
                                              : 0;
     if (status > 1 || size != expected || offset != RESPONSE_SIZE || variable > b.size ||

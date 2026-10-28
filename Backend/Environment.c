@@ -21,3 +21,11 @@ char *environment_request(const void *body, size_t length, size_t *result_length
     pthread_mutex_unlock(&environment_mutex);
     return (char *)result.data;
 }
+
+void environment_registry_socket(char *path, size_t size) {
+    pthread_mutex_lock(&environment_mutex);
+    deadline = now() + 3;
+    failure[0] = 0;
+    resolve_registry_socket(path, size);
+    pthread_mutex_unlock(&environment_mutex);
+}

@@ -28,7 +28,7 @@
 #define MAX_TEXT (4u * 1024u * 1024u)
 #define HELPER_NAME "outer-files-helper"
 #define HELPER_PATH "/usr/local/bin/" HELPER_NAME
-#define HELPER_CAPABILITIES 3u
+#define HELPER_CAPABILITIES 515u
 typedef struct {
     unsigned char *data;
     size_t size;

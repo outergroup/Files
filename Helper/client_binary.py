@@ -1,5 +1,5 @@
 import struct
-OPS={'list':1,'read':2,'save':3,'move':4,'signal':6,'targets':7,'preview':8,'draft':9}
+OPS={'list':1,'read':2,'save':3,'move':4,'signal':6,'targets':7,'preview':8,'draft':9,'places':10}
 def encode_client(operation, **values):
     b=bytearray(72)
     struct.pack_into('<IIII',b,0,0x51434c46,1,0,OPS[operation])
@@ -26,7 +26,7 @@ def decode_client(b):
     assert meta[:4]==b'FLHS' and n(meta,16)==len(meta)
     result=dict(ok=True,path=text(meta,48),revision=text(meta,56),dirty=bool(n(b,40)&1),draftConflict=bool(n(b,40)&2))
     if n(meta,8)==2:result.update(data=body,type=text(b,32),contents=body.decode(errors='replace'))
-    if n(meta,8)==1:
+    if n(meta,8) in (1,10):
         result['parent']=text(meta,56)
         result['entries']=[dict(name=text(meta,64+i*48),path=text(meta,72+i*48)) for i in range(n(meta,20))]
     return result
