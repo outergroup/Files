@@ -1,4 +1,5 @@
 #include "helper.h"
+#include <sys/file.h>
 static void parent_path(const char *path, char out[PATH_MAX]) {
     snprintf(out, PATH_MAX, "%s", path);
     char *p = strrchr(out, '/');
@@ -129,6 +130,93 @@ static void mount_path_decode(char *path) {
     *out = 0;
 }
 #endif
+static bool personal_places_path(char path[PATH_MAX], bool create) {
+    const char *config = getenv("XDG_CONFIG_HOME");
+    char home[PATH_MAX];
+    if (!config || *config != '/') {
+        if (!expand_path("~", home)) return false;
+        if (snprintf(path, PATH_MAX, "%s/.config/outer-files", home) >= PATH_MAX) {
+            fail("favorites path is too long"); return false;
+        }
+    } else if (snprintf(path, PATH_MAX, "%s/outer-files", config) >= PATH_MAX) {
+        fail("favorites path is too long"); return false;
+    }
+    if (create) {
+        for (char *p = path + 1; ; p++) {
+            if (*p && *p != '/') continue;
+            char saved = *p;
+            *p = 0;
+            int result = mkdir(path, 0700);
+            *p = saved;
+            if (result && errno != EEXIST) { fail("Cannot create favorites folder: %s", strerror(errno)); return false; }
+            if (!saved) break;
+        }
+    }
+    size_t length = strlen(path);
+    if (length + sizeof("/places.tsv") > PATH_MAX) { fail("favorites path is too long"); return false; }
+    strcpy(path + length, "/places.tsv");
+    return true;
+}
+
+static void read_places(const char *path, FileEntry **rows, size_t *count) {
+    FILE *config = fopen(path, "r");
+    if (config) {
+        char *line = NULL; size_t capacity = 0;
+        while (getline(&line, &capacity, config) >= 0) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (*line != '/') continue;
+            char *label = strchr(line, '\t');
+            if (!label) continue;
+            *label++ = 0;
+            place_add(rows, count, line, label);
+        }
+        free(line); fclose(config);
+    }
+}
+
+static BinaryReply add_place(const char *path) {
+    BinaryReply reply = {0};
+    char resolved[PATH_MAX], config[PATH_MAX];
+    struct stat st;
+    if (!realpath(path, resolved) || stat(resolved, &st)) {
+        fail("Cannot add favorite: %s", strerror(errno)); return reply;
+    }
+    if (!S_ISDIR(st.st_mode)) { fail("Only folders can be added to Favorites"); return reply; }
+    if (strpbrk(resolved, "\t\r\n")) { fail("Folder paths containing tabs or newlines cannot be saved as favorites"); return reply; }
+    if (!personal_places_path(config, true)) return reply;
+    int fd = open(config, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (fd < 0) { fail("Cannot open favorites: %s", strerror(errno)); return reply; }
+    if (flock(fd, LOCK_EX)) { fail("Cannot lock favorites: %s", strerror(errno)); close(fd); return reply; }
+    FILE *file = fdopen(fd, "r+");
+    if (!file) { fail("Cannot read favorites: %s", strerror(errno)); close(fd); return reply; }
+    char *line = NULL; size_t capacity = 0; bool found = false;
+    int last = '\n';
+    while (getline(&line, &capacity, file) >= 0) {
+        size_t length = strlen(line);
+        if (length) last = line[length - 1];
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        char existing[PATH_MAX];
+        if (!strcmp(line, resolved) || (realpath(line, existing) && !strcmp(existing, resolved))) found = true;
+    }
+    free(line);
+    if (ferror(file)) fail("Cannot read favorites: %s", strerror(errno));
+    if (!failure[0] && !found) {
+        const char *name = strrchr(resolved, '/');
+        name = name && name[1] ? name + 1 : resolved;
+        if (fseek(file, 0, SEEK_END) ||
+            fprintf(file, "%s%s\t%s\n", last == '\n' ? "" : "\n", resolved, name) < 0 ||
+            fflush(file) || fsync(fd)) fail("Cannot save favorite: %s", strerror(errno));
+    }
+    if (fclose(file)) fail("Cannot close favorites: %s", strerror(errno));
+    if (!failure[0]) {
+        reply = response_create(OP_ADD_PLACE, 0, 0);
+        binary_string(&reply.metadata, 48, resolved);
+    }
+    return reply;
+}
+
 static BinaryReply list_places(void) {
     FileEntry *rows = NULL;
     size_t count = 0;
@@ -152,19 +240,9 @@ static BinaryReply list_places(void) {
         free(line); fclose(mounts);
     }
 #endif
-    FILE *config = fopen("/etc/outer-files/places.tsv", "r");
-    if (config) {
-        char *line = NULL; size_t capacity = 0;
-        while (getline(&line, &capacity, config) >= 0) {
-            line[strcspn(line, "\r\n")] = 0;
-            if (*line != '/') continue;
-            char *label = strchr(line, '\t');
-            if (!label) continue;
-            *label++ = 0;
-            place_add(&rows, &count, line, label);
-        }
-        free(line); fclose(config);
-    }
+    read_places("/etc/outer-files/places.tsv", &rows, &count);
+    char personal[PATH_MAX];
+    if (personal_places_path(personal, false)) read_places(personal, &rows, &count);
     BinaryReply reply = response_create(OP_PLACES, (uint32_t)count, FILE_ROW_SIZE);
     for (size_t i = 0; i < count; i++) {
         size_t offset = RESPONSE_SIZE + i * FILE_ROW_SIZE;
@@ -189,12 +267,18 @@ BinaryReply local_binary_operation(const Request *request, Bytes body) {
     if (!expand_path(request->path, path))
         return r;
     switch (op) {
+    case OP_ADD_PLACE:
+        r = add_place(path);
+        break;
     case OP_PLACES:
         r = list_places();
         break;
-    case OP_LIST:
-        r = list_files(path);
+    case OP_LIST: {
+        char resolved[PATH_MAX];
+        if (!realpath(path, resolved)) fail("%s: %s", path, strerror(errno));
+        else r = list_files(resolved);
         break;
+    }
     case OP_READ:
         if (!request->limit || request->limit > MAX_DATA) {
             fail("invalid file size limit");

@@ -23,3 +23,8 @@
 .place.selected{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent)}
 .place:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 @media(max-width:900px),(max-height:600px){.places{padding:0 10px 6px;gap:3px}.place{padding:6px 8px;font-size:12px}}
+
+.add-favorite{margin-left:auto;color:var(--accent)}
+.add-favorite:disabled,.menu button:disabled{color:var(--muted);cursor:default}
+.add-favorite:disabled:hover,.menu button:disabled:hover{background:transparent;color:var(--muted)}
+.add-favorite[hidden]{display:none}

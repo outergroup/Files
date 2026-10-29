@@ -65,6 +65,26 @@ backend architectures into `build/linux-package/RemoteLinuxBinaries`, then run:
 The archive is written to `build/release/Files.tar.gz`. Deployment-specific
 publishing should live outside this repository.
 
+## Favorites
+
+On the host, use **Add to Favorites** beside the current folder path, or
+right-click a folder and choose **Add to Favorites**. Saved folders appear in
+the places bar immediately and persist across restarts. Existing favorites
+show **In Favorites** to prevent duplicates.
+
+Personal favorites are stored as `path<TAB>label` rows in
+`$XDG_CONFIG_HOME/outer-files/places.tsv`, defaulting to
+`~/.config/outer-files/places.tsv` for the backend's user. Shared entries in
+`/etc/outer-files/places.tsv` are still loaded. Adding favorites in containers
+is not yet supported.
+
+Run the persistence tests with a compiled `Tests/EnvironmentDriver.c` plus
+`Backend/Environment.c` driver:
+
+```bash
+python3 Scripts/test_favorites.py /path/to/environment-driver
+```
+
 ## Remote Development
 
 To test a deployed remote host with curl:

@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-enum { OP_LIST = 1, OP_READ, OP_SAVE, OP_MOVE, OP_PROCESSES, OP_SIGNAL, OP_PLACES = 10 };
+enum { OP_LIST = 1, OP_READ, OP_SAVE, OP_MOVE, OP_PROCESSES, OP_SIGNAL, OP_PLACES = 10, OP_ADD_PLACE = 11 };
 enum { REQUEST_SIZE = 80, RESPONSE_SIZE = 64, FILE_ROW_SIZE = 48, PROCESS_ROW_SIZE = 96 };
 #define REQUEST_MAGIC 0x52484c46u
 #define RESPONSE_MAGIC 0x53484c46u
