@@ -402,6 +402,14 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var currentSize = CGSize(width: 900, height: 600)
     private var urlSession: URLSession?
     private var sessionUsername: String?
+    private var environmentEndpoint: URL?
+    private var environmentTarget = "host"
+    private var environmentTargets: [(id: String, name: String, running: Bool)] = []
+    private var environmentMenuID: UUID?
+    private var environmentFrame = CGRect.zero
+    private var addFavoriteFrame = CGRect.zero
+    private var savingFavorite = false
+    private var listingGeneration = 0
     private var filesEndpoint: URL?
     private var openersEndpoint: URL?
     private var previewEndpoint: URL?
@@ -419,6 +427,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var dragStartedForSelectionIndex: Int?
     private var isDraggingFolderToFavorites = false
     private var filePromiseEntries: [UUID: FileEntry] = [:]
+    private var filePromiseTargets: [UUID: String] = [:]
     private var favoriteLocations: [FavoriteLocation] = []
     private var scrollOffset: CGFloat = 0
     private var isLoading = false
@@ -527,6 +536,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             registerRootLayerIfNeeded()
             outerframeHost.setInputMode(.rawKeys)
             updatePasteboardCapabilities()
+            environmentTarget = targetFromURL(arguments.url)
+            discoverEnvironments()
+            loadPlaces()
             let initialURLPath = pathFromURL(arguments.url)
             let initialPath = initialURLPath ?? currentPath
             fetchFiles(path: initialPath,
@@ -604,7 +616,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             handleContextMenuItemSelected(menuID: menuID, itemID: itemID)
 
         case .historyTraversal(_, let url):
-            fetchFiles(path: pathFromURL(url) ?? currentPath)
+            changeEnvironment(targetFromURL(url))
+            fetchFiles(path: pathFromURL(url) ?? "~")
 
         case .accessibilityAction(let identifier, let action, let value):
             performAccessibilityAction(identifier: identifier, action: action, value: value)
@@ -644,6 +657,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func configureNetworking() {
         if let base = outerframeHost.pluginBaseURL() {
+            environmentEndpoint = URL(string: "/api/environments", relativeTo: base)?.absoluteURL
             filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
             openersEndpoint = URL(string: "/api/openers", relativeTo: base)?.absoluteURL
             previewEndpoint = URL(string: "/api/preview", relativeTo: base)?.absoluteURL
@@ -804,12 +818,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             let listWidth = max(width - previewWidth, 1)
 
             favoritesBarLayer.frame = CGRect(x: 0,
-                                             y: max(height - favoritesBarHeight, 0),
-                                             width: listWidth,
+                                             y: max(height - topChromeHeight, 0),
+                                             width: width,
                                              height: favoritesBarHeight)
             breadcrumbBarLayer.frame = CGRect(x: 0,
-                                              y: max(height - topChromeHeight, 0),
-                                              width: listWidth,
+                                              y: max(height - breadcrumbBarHeight, 0),
+                                              width: width,
                                               height: breadcrumbBarHeight)
 
             let headerY = max(height - topChromeHeight - headerHeight, 0)
@@ -1634,9 +1648,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 }
 
                 var x = horizontalInset
-                x = addFavoriteLayer(title: "Home",
-                                     path: homePath ?? "~",
-                                     x: x)
                 for favorite in favoriteLocations {
                     guard x < favoritesBarLayer.bounds.width - horizontalInset else { break }
                     x = addFavoriteLayer(title: favorite.title,
@@ -1687,7 +1698,30 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             breadcrumbSegmentFrames.removeAll()
 
             appearance.performAsCurrentDrawingAppearance {
-                var x = horizontalInset
+                addFavoriteFrame = .zero
+                let reservedWidth: CGFloat = environmentTarget == "host" ? 150 : 0
+                if environmentTarget == "host" {
+                    addFavoriteFrame = CGRect(x: max(horizontalInset, breadcrumbBarLayer.bounds.width - 150), y: 5, width: 140, height: 24)
+                    let label = makeTextLayer(size: 13, weight: .medium)
+                    label.string = isFavoritePath(currentPath) ? "In Favorites" : "Add to Favorites"
+                    label.foregroundColor = (isFavoritePath(currentPath) || savingFavorite || isLoading ? NSColor.secondaryLabelColor : NSColor.controlAccentColor).cgColor
+                    label.frame = addFavoriteFrame.insetBy(dx: 4, dy: 4)
+                    breadcrumbBarLayer.addSublayer(label)
+                }
+                let name = environmentTargets.first { $0.id == environmentTarget }?.name ?? (environmentTarget == "host" ? "Host" : "Unavailable container")
+                let title = (environmentTarget == "host" ? "Host — " : "") + name + " ▾"
+                let width = min(textWidth(title, fontSize: 13, weight: .medium) + 24, 260)
+                environmentFrame = CGRect(x: horizontalInset, y: 6, width: width, height: 24)
+                let button = CALayer()
+                button.frame = environmentFrame
+                button.cornerRadius = 6
+                button.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+                let label = makeTextLayer(size: 13, weight: .medium)
+                label.string = title
+                label.frame = CGRect(x: 10, y: 4, width: width - 20, height: 17)
+                button.addSublayer(label)
+                breadcrumbBarLayer.addSublayer(button)
+                var x = environmentFrame.maxX + 12
                 let segments = breadcrumbSegments()
                 for (index, segment) in segments.enumerated() {
                     if index > 0 {
@@ -1700,7 +1734,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     }
 
                     let width = min(max(textWidth(segment.title, fontSize: 13, weight: .medium) + 18, 28),
-                                    max(breadcrumbBarLayer.bounds.width - x - horizontalInset, 28))
+                                    max(breadcrumbBarLayer.bounds.width - x - horizontalInset - reservedWidth, 28))
                     let frame = CGRect(x: x, y: 5, width: width, height: 24)
                     breadcrumbSegmentFrames.append((frame, segment.path))
 
@@ -1718,7 +1752,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     breadcrumbBarLayer.addSublayer(segmentLayer)
 
                     x += width
-                    if x >= breadcrumbBarLayer.bounds.width - horizontalInset {
+                    if x >= breadcrumbBarLayer.bounds.width - horizontalInset - reservedWidth {
                         break
                     }
                 }
@@ -1727,13 +1761,28 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func breadcrumbSegments() -> [BreadcrumbSegment] {
-        var segments = [BreadcrumbSegment(title: "/", path: "/")]
-        var accumulatedPath = ""
-        for component in currentPath.split(separator: "/", omittingEmptySubsequences: true) {
-            accumulatedPath += "/" + component
-            segments.append(BreadcrumbSegment(title: String(component), path: accumulatedPath))
+        let path = currentPath.replacingOccurrences(of: "\\", with: "/")
+        if path == "~" { return [BreadcrumbSegment(title: "Home", path: "~")] }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        var root = "/", remaining = components
+        if let drive = components.first, drive.count == 2, drive.last == ":" {
+            root = drive + "/"
+            remaining.removeFirst()
+        } else if path.hasPrefix("//"), components.count >= 2 {
+            root = "//" + components[0] + "/" + components[1] + "/"
+            remaining.removeFirst(2)
+        } else if !path.hasPrefix("/") {
+            return [BreadcrumbSegment(title: path, path: path)]
+        }
+        var segments = [BreadcrumbSegment(title: root, path: root)]
+        var accumulated = root
+        for component in remaining {
+            if !accumulated.hasSuffix("/") { accumulated += "/" }
+            accumulated += component
+            segments.append(BreadcrumbSegment(title: component, path: accumulated))
         }
         return segments
+
     }
 
     private static func inferHomePath(from path: String) -> String? {
@@ -1754,6 +1803,94 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         notifyAccessibilityLayoutChanged()
     }
 
+    private func targetFromURL(_ string: String?) -> String {
+        string.flatMap { URLComponents(string: $0)?.queryItems?.first { $0.name == "target" }?.value } ?? "host"
+    }
+
+    private func environmentRequest(operation: UInt32, path: String, target: String? = nil) -> URLRequest? {
+        guard let environmentEndpoint else { return nil }
+        return FilesEnvironment.request(url: environmentEndpoint, operation: operation, target: target ?? environmentTarget, path: path)
+    }
+
+    private func changeEnvironment(_ target: String) {
+        guard target != environmentTarget else { return }
+        listingGeneration += 1
+        environmentTarget = target
+        isLoading = false
+        currentPath = "~"
+        homePath = nil
+        parentPath = nil
+        favoriteLocations = []
+        entries = []
+        selectedIndex = nil
+        pendingDirectoryMenuEntries.removeAll()
+        pendingOpenMenuEntries.removeAll()
+        clearPreviewPane()
+        updatePasteboardCapabilities()
+        updateFavoritesBar()
+        updateBreadcrumbBar()
+        updateRows()
+        loadPlaces()
+    }
+
+    private func discoverEnvironments(completion: (() -> Void)? = nil) {
+        guard let request = environmentRequest(operation: 7, path: "", target: "host"), let session = urlSession else { return }
+        Task {
+            do {
+                let (data, _) = try await session.data(for: request)
+                let result = try FilesEnvironment.targets(data)
+                environmentTargets = result.targets
+                if !result.errors.isEmpty { statusLayer.string = result.errors.joined(separator: " · ") }
+                updateFavoritesBar()
+                updateBreadcrumbBar()
+                notifyAccessibilityLayoutChanged()
+                completion?()
+            } catch { statusLayer.string = error.localizedDescription; notifyAccessibilityLayoutChanged() }
+        }
+    }
+
+    private func showEnvironmentMenu(at point: CGPoint) {
+        discoverEnvironments { [weak self] in
+            guard let self else { return }
+            let id = UUID()
+            environmentMenuID = id
+            outerframeHost.showContextMenu(menuID: id, items: environmentTargets.map {
+                OuterframeContextMenuItem(id: $0.id, title: ($0.id == "host" ? "Host — " : "") + $0.name + ($0.running ? "" : " · Stopped"), isEnabled: $0.running)
+            }, at: point)
+        }
+    }
+
+    private func loadPlaces() {
+        let target = environmentTarget
+        guard let request = environmentRequest(operation: 10, path: "~"), let session = urlSession else { return }
+        Task {
+            do {
+                let (data, _) = try await session.data(for: request)
+                let result = try FilesEnvironment.list(data, operation: 10)
+                guard environmentTarget == target else { return }
+                favoriteLocations = result.entries.map { FavoriteLocation(title: $0.name, path: $0.path) }
+                updateFavoritesBar()
+                updateBreadcrumbBar()
+                notifyAccessibilityLayoutChanged()
+            } catch { if environmentTarget == target { statusLayer.string = error.localizedDescription } }
+        }
+    }
+
+    private func addFavoritePath(_ path: String) {
+        guard environmentTarget == "host", !isLoading, !savingFavorite, !isFavoritePath(path),
+              let request = environmentRequest(operation: 11, path: path), let session = urlSession else { return }
+        savingFavorite = true
+        updateBreadcrumbBar()
+        Task {
+            defer { savingFavorite = false; updateBreadcrumbBar(); notifyAccessibilityLayoutChanged() }
+            do {
+                let (data, _) = try await session.data(for: request)
+                _ = try FilesEnvironment.envelope(data)
+                if environmentTarget == "host" { loadPlaces(); statusLayer.string = "Added to Favorites" }
+            } catch { if environmentTarget == "host" { statusLayer.string = error.localizedDescription } }
+        }
+    }
+
     private func pathFromURL(_ urlString: String?) -> String? {
         guard let urlString,
               let components = URLComponents(string: urlString),
@@ -1771,7 +1908,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         var queryItems = components.queryItems ?? []
-        queryItems.removeAll { $0.name == "path" }
+        queryItems.removeAll { $0.name == "path" || $0.name == "target" }
+        queryItems.append(URLQueryItem(name: "target", value: environmentTarget))
         queryItems.append(URLQueryItem(name: "path", value: path))
         components.queryItems = queryItems
         return components.url
@@ -1785,23 +1923,18 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func fetchFiles(path: String, replaceHistoryEntryAfterLoad: Bool = false) {
-        guard !isLoading, let filesEndpoint else { return }
+        guard let request = environmentRequest(operation: 1, path: path) else { return }
+        listingGeneration += 1
+        let generation = listingGeneration
+        stopPreviewChangeMonitoring()
+        previewRequestGeneration += 1
         isLoading = true
         shouldReplaceHistoryEntryAfterLoad = replaceHistoryEntryAfterLoad
         statusLayer.string = "Loading..."
 
-        guard let request = Self.binaryPathRequest(url: filesEndpoint,
-                                                   magic: FilePathRequestBinaryFormat.magic,
-                                                   path: path) else {
-            isLoading = false
-            shouldReplaceHistoryEntryAfterLoad = false
-            statusLayer.string = "Could not build file request"
-            return
-        }
-
         urlSession?.dataTask(with: request) { [weak self] data, _, error in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.listingGeneration == generation else { return }
                 self.isLoading = false
                 if let error {
                     self.shouldReplaceHistoryEntryAfterLoad = false
@@ -1816,7 +1949,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     return
                 }
                 do {
-                    let response = try Self.decodeFileList(data)
+                    let response = try FilesEnvironment.list(data, operation: 1)
                     self.currentPath = response.path
                     if self.homePath == nil {
                         self.homePath = Self.inferHomePath(from: response.path) ?? (path == "~" ? response.path : nil)
@@ -1843,7 +1976,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     }
                     self.shouldReplaceHistoryEntryAfterLoad = false
                 } catch {
-                    self.statusLayer.string = "Could not read file list"
+                    self.statusLayer.string = error.localizedDescription
                     self.shouldReplaceHistoryEntryAfterLoad = false
                     self.notifyAccessibilityLayoutChanged()
                 }
@@ -1997,6 +2130,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                               preferredKind: FilePreviewKind,
                                               initialMetadata: FilePreviewMetadata) {
         previewMonitorTask?.cancel()
+        guard environmentTarget == "host" else { return }
         previewObservedMetadata = initialMetadata
         previewMetadataRequestInFlight = false
         previewMonitorTask = Task { @MainActor [weak self] in
@@ -2121,21 +2255,13 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func fetchPreview(for entry: FileEntry, generation: Int, preferredKind: FilePreviewKind) {
-        guard let previewEndpoint,
-              let urlSession else {
+        guard let urlSession else {
             previewIsLoading = false
             previewMessage = "Preview unavailable."
             renderPreviewPane()
             return
         }
-        guard let request = Self.binaryPathRequest(url: previewEndpoint,
-                                                   magic: FilePathRequestBinaryFormat.magic,
-                                                   path: entry.path) else {
-            previewIsLoading = false
-            previewMessage = "Could not build preview request."
-            renderPreviewPane()
-            return
-        }
+        guard let request = environmentRequest(operation: 8, path: entry.path) else { return }
 
         urlSession.dataTask(with: request) { [weak self] data, response, error in
             Task { @MainActor in
@@ -2163,7 +2289,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     self.renderPreviewPane()
                     return
                 }
-                guard let data else {
+                guard let responseData = data else {
                     self.previewBodyText = ""
                     self.previewMessage = "Could not load preview."
                     self.setPreviewImage(nil)
@@ -2172,7 +2298,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     return
                 }
 
-                let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+                let payload: (metadata: Data, body: Data, type: String)
+                do { payload = try FilesEnvironment.envelope(responseData) }
+                catch { self.previewMessage = error.localizedDescription; self.renderPreviewPane(); return }
+                let data = payload.body
+                let contentType = payload.type.lowercased()
                 if preferredKind == .media || Self.isMediaPreviewContentType(contentType) {
                     if let imagePreview = Self.previewImage(from: data, contentType: contentType) {
                         self.previewBodyText = ""
@@ -2528,6 +2658,14 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         previewImageDragStartPoint = nil
         isDraggingFolderToFavorites = false
 
+        if environmentFrame.contains(breadcrumbBarLayer.convert(point, from: rootLayer)) {
+            showEnvironmentMenu(at: point)
+            return
+        }
+        if !addFavoriteFrame.isEmpty, addFavoriteFrame.contains(breadcrumbBarLayer.convert(point, from: rootLayer)) {
+            addFavoritePath(currentPath)
+            return
+        }
         if let favoritePath = favoritePath(at: point) {
             selectedIndex = nil
             selectionDidChange()
@@ -2808,6 +2946,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func updatePasteboardCapabilities() {
+        if environmentTarget != "host" {
+            outerframeHost.setAcceptedPasteboardPasteTypes([])
+            outerframeHost.setPasteboardDropBehaviorUniform([])
+            return
+        }
         outerframeHost.setAcceptedPasteboardPasteTypes([
             NSPasteboard.PasteboardType.fileURL.rawValue,
             Self.droppedFileAccessPasteboardTypeIdentifier
@@ -2825,7 +2968,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
            selectedPreviewAttributedText() != nil || selectedFileEntryForCopy() != nil {
             enabledCommands.insert(.copy)
         }
-        if requestedCommands.contains(.paste) {
+        if requestedCommands.contains(.paste), environmentTarget == "host" {
             enabledCommands.insert(.paste)
         }
         return enabledCommands
@@ -2860,6 +3003,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
+        let containerRequest = environmentTarget == "host" ? nil : environmentRequest(operation: 8, path: entry.path)
         let copyID = UUID()
         let targetDirectoryURL = stagingDirectoryURL
             .appendingPathComponent("files-copy-\(copyID.uuidString)", isDirectory: true)
@@ -2869,10 +3013,14 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         statusLayer.string = "Copying \(entry.name)..."
         Task { [weak self, urlSession, downloadURL, targetDirectoryURL, targetURL, requestID] in
             do {
-                try await Self.writeDownload(from: downloadURL,
-                                             using: urlSession,
-                                             to: targetURL,
-                                             creating: targetDirectoryURL)
+                if let containerRequest {
+                    let (bytes, _) = try await urlSession.data(for: containerRequest)
+                    let reply = try FilesEnvironment.envelope(bytes)
+                    try FileManager.default.createDirectory(at: targetDirectoryURL, withIntermediateDirectories: true)
+                    try reply.body.write(to: targetURL, options: .atomic)
+                } else {
+                    try await Self.writeDownload(from: downloadURL, using: urlSession, to: targetURL, creating: targetDirectoryURL)
+                }
                 let item = OuterframeContentPasteboardItem(representations: [
                     OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.fileURL.rawValue,
                                                               data: Data(targetURL.absoluteString.utf8))
@@ -2935,8 +3083,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                                       isEnabled: true,
                                                                       systemImageName: "folder"),
                                             OuterframeContextMenuItem(id: "add-to-favorites",
-                                                                      title: "Add to Favorites",
-                                                                      isEnabled: !isFavoritePath(entry.path),
+                                                                      title: isFavoritePath(entry.path) ? "In Favorites" : "Add to Favorites",
+                                                                      isEnabled: environmentTarget == "host" && !savingFavorite && !isFavoritePath(entry.path),
                                                                       systemImageName: "star"),
                                             contextMenuSeparator(id: "directory-separator"),
                                             OuterframeContextMenuItem(id: "paste",
@@ -2944,7 +3092,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                                       action: .standardPaste,
                                                                       isEnabled: true,
                                                                       systemImageName: "clipboard")
-                                           ],
+                                           ].filter { environmentTarget == "host" || $0.id == "open-directory" },
                                            at: point)
             return
         }
@@ -2996,7 +3144,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                         OuterframeContextMenuItem(id: "paste",
                                                                   title: "Paste",
                                                                   action: .standardPaste,
-                                                                  isEnabled: true,
+                                                                  isEnabled: environmentTarget == "host",
                                                                   systemImageName: "clipboard")
                                        ],
                                        at: point)
@@ -3089,6 +3237,13 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleContextMenuItemSelected(menuID: UUID, itemID: String) {
+        if menuID == environmentMenuID {
+            environmentMenuID = nil
+            guard environmentTargets.contains(where: { $0.id == itemID && $0.running }) else { return }
+            changeEnvironment(itemID)
+            openDirectory(path: "~")
+            return
+        }
         if let pending = pendingOpenMenuEntries.removeValue(forKey: menuID),
            itemID.hasPrefix("open-"),
            let index = Int(itemID.dropFirst("open-".count)),
@@ -3149,13 +3304,19 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             completion(.success([]))
             return
         }
-        guard let request = Self.binaryPathRequest(url: openersEndpoint,
-                                                   magic: FileOpenersBinaryFormat.requestMagic,
-                                                   path: entry.path) else {
-            completion(.failure("could not build request"))
-            return
+        let target = environmentTarget
+        let request: URLRequest
+        if target != "host", var components = URLComponents(url: openersEndpoint, resolvingAgainstBaseURL: false) {
+            components.queryItems = [URLQueryItem(name: "path", value: entry.path), URLQueryItem(name: "contentType", value: "public.text")]
+            guard let url = components.url else { completion(.failure("could not build request")); return }
+            request = URLRequest(url: url)
+        } else {
+            guard let pathRequest = Self.binaryPathRequest(url: openersEndpoint, magic: FileOpenersBinaryFormat.requestMagic, path: entry.path) else {
+                completion(.failure("could not build request")); return
+            }
+            request = pathRequest
         }
-        urlSession.dataTask(with: request) { data, response, error in
+        urlSession.dataTask(with: request) { [weak self] data, response, error in
             let result: FileOpenersFetchResult
             if let error {
                 result = .failure(error.localizedDescription)
@@ -3164,11 +3325,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 result = .failure(Self.responseErrorMessage(data: data, fallback: "HTTP \(httpResponse.statusCode)"))
             } else if let data,
                       let openers = Self.decodeFileOpeners(data) {
-                result = .success(openers)
+                result = .success(target == "host" ? openers : Array(openers.filter { $0.serviceID == "org.outershell.Plaintext" }.prefix(1)))
             } else {
                 result = .failure("invalid response")
             }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
+                guard self?.environmentTarget == target else { return }
                 completion(result)
             }
         }.resume()
@@ -3331,10 +3493,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func openerNavigationURL(_ opener: FileOpener) -> URL? {
+        guard let url = baseOpenerNavigationURL(opener) else { return nil }
+        guard opener.serviceID == "org.outershell.Plaintext", var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        var items = components.queryItems ?? []
+        items.removeAll { $0.name == "target" }
+        items.append(URLQueryItem(name: "target", value: environmentTarget))
+        components.queryItems = items
+        return components.url
+    }
+
+    private func baseOpenerNavigationURL(_ opener: FileOpener) -> URL? {
         let socketPath = opener.socketPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if !socketPath.isEmpty {
             let path = pathAndQuery(fromOpenerURL: opener.url, socketPath: socketPath)
-            return URL(string: "http+unix://\(percentEncodedSocketPath(socketPath))\(path)")
+            let scheme = socketPath.hasPrefix("\\\\.\\pipe\\") ? "http+pipe" : "http+unix"
+            return URL(string: "\(scheme)://\(percentEncodedSocketPath(socketPath))\(path)")
         }
 
         let rawURL = opener.url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3354,7 +3527,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return normalizedPathAndQuery(suffix)
         }
 
-        if trimmed.lowercased().hasPrefix("http+unix://") {
+        if trimmed.lowercased().hasPrefix("http+unix://") || trimmed.lowercased().hasPrefix("http+pipe://") {
             let prefixLength = "http+unix://".count
             let startIndex = trimmed.index(trimmed.startIndex, offsetBy: prefixLength)
             let authorityAndSuffix = String(trimmed[startIndex...])
@@ -3391,8 +3564,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
     private func addFavorite(_ entry: FileEntry) {
         guard entry.isDirectory, !isFavoritePath(entry.path) else { return }
-        favoriteLocations.append(FavoriteLocation(title: entry.name, path: entry.path))
-        updateFavoritesBar()
+        addFavoritePath(entry.path)
     }
 
     private func isFavoritePath(_ path: String) -> Bool {
@@ -3415,6 +3587,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func beginDraggingFilePromise(for entry: FileEntry,
                                           preview dragPreview: DragPreview?,
                                           previewFrameOrigin: CGPoint?) {
+        guard environmentTarget == "host" || !entry.isDirectory else { statusLayer.string = "Dragging container folders is not supported"; return }
         guard outerframeHost.stagedFileDirectoryURL != nil else {
             dragStartedForSelectionIndex = nil
             statusLayer.string = "Could not prepare drag"
@@ -3424,6 +3597,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
 
         let promiseID = UUID()
         filePromiseEntries[promiseID] = entry
+        filePromiseTargets[promiseID] = environmentTarget
         guard let pasteboardItem = outerframeHost.filePromisePasteboardItem(promiseID: promiseID,
                                                                             name: entry.name,
                                                                             fileSize: entry.isDirectory ? nil : entry.size,
@@ -3470,6 +3644,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
+        let target = filePromiseTargets[promiseID] ?? "host"
+        let containerRequest = target == "host" ? nil : environmentRequest(operation: 8, path: entry.path, target: target)
         let targetDirectoryURL = stagingDirectoryURL
             .appendingPathComponent("files-promise-\(promiseID.uuidString)", isDirectory: true)
         let targetURL = targetDirectoryURL
@@ -3478,7 +3654,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         statusLayer.string = "Preparing \(entry.name)..."
         Task { [weak self, urlSession, downloadURL, targetDirectoryURL, targetURL, entry, promiseID, requestID] in
             do {
-                if entry.isDirectory {
+                if let containerRequest {
+                    let (bytes, _) = try await urlSession.data(for: containerRequest)
+                    let reply = try FilesEnvironment.envelope(bytes)
+                    try FileManager.default.createDirectory(at: targetDirectoryURL, withIntermediateDirectories: true)
+                    try reply.body.write(to: targetURL, options: .atomic)
+                } else if entry.isDirectory {
                     guard let filesEndpoint = self?.filesEndpoint else {
                         throw NSError(domain: NSCocoaErrorDomain,
                                       code: NSFileReadUnknownError,
@@ -3500,6 +3681,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 guard let self else { return }
                 self.statusLayer.string = ""
                 self.filePromiseEntries.removeValue(forKey: promiseID)
+                self.filePromiseTargets.removeValue(forKey: promiseID)
                 self.outerframeHost.sendFilePromiseWriteResponse(requestID: requestID,
                                                                  promiseID: promiseID,
                                                                  localPath: targetURL.path,
@@ -3510,6 +3692,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 self.dragStartedForSelectionIndex = nil
                 self.statusLayer.string = "Could not prepare drag"
                 self.filePromiseEntries.removeValue(forKey: promiseID)
+                self.filePromiseTargets.removeValue(forKey: promiseID)
                 self.outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
                                                                 promiseID: promiseID,
                                                                 errorMessage: String(describing: error))
@@ -3871,6 +4054,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func upload(files: [DroppedLocalFile], to directory: String) {
+        guard environmentTarget == "host" else { statusLayer.string = "Uploading into containers is not supported"; return }
         guard let uploadEndpoint, let mkdirEndpoint, let urlSession else { return }
         statusLayer.string = "Uploading \(files.count) file\(files.count == 1 ? "" : "s")..."
 
@@ -4127,6 +4311,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         guard let node = accessibilityNodes[identifier], node.isEnabled, node.actions.supports(action) else { return }
         switch action {
         case .press, .focus:
+            if node.value == "files:environment" { showEnvironmentMenu(at: CGPoint(x: node.frame.midX, y: node.frame.midY)); return }
+            if node.value == "files:add-favorite" { addFavoritePath(currentPath); return }
             if node.role == .row, let path = node.value, let index = entries.firstIndex(where: { $0.path == path }) {
                 selectIndex(index)
             } else if node.role == .button, let path = node.value {
@@ -4156,8 +4342,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
 
-        children.append(OuterframeAccessibilityNode(identifier: 0, role: .container, frame: favoritesBarLayer.frame, label: "Favorites", children: buildFavoritesAccessibilityNodes(nextIdentifier: &nextIdentifier)))
         children.append(OuterframeAccessibilityNode(identifier: 0, role: .container, frame: breadcrumbBarLayer.frame, label: "Location", children: buildBreadcrumbAccessibilityNodes(nextIdentifier: &nextIdentifier)))
+        children.append(OuterframeAccessibilityNode(identifier: 0, role: .container, frame: favoritesBarLayer.frame, label: "Favorites", children: buildFavoritesAccessibilityNodes(nextIdentifier: &nextIdentifier)))
         children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                           role: .staticText,
                                           frame: headerLayer.convert(nameHeaderLayer.frame, to: rootLayer),
@@ -4207,7 +4393,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func buildFavoritesAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
-        let favorites = [(title: "Home", path: homePath ?? "~")] + favoriteLocations.map { (title: $0.title, path: $0.path) }
+        let favorites = favoriteLocations.map { (title: $0.title, path: $0.path) }
         var nodes: [OuterframeAccessibilityNode] = []
         for (index, favorite) in favorites.enumerated() where index < favoriteFrames.count {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -4223,6 +4409,12 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func buildBreadcrumbAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
         let segments = breadcrumbSegments()
         var nodes: [OuterframeAccessibilityNode] = []
+        nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button,
+            frame: breadcrumbBarLayer.convert(environmentFrame, to: rootLayer), label: "Location: " + (environmentTargets.first { $0.id == environmentTarget }?.name ?? environmentTarget), value: "files:environment"))
+        if environmentTarget == "host" {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button,
+                frame: breadcrumbBarLayer.convert(addFavoriteFrame, to: rootLayer), label: isFavoritePath(currentPath) ? "In Favorites" : "Add to Favorites", value: "files:add-favorite", isEnabled: !isLoading && !savingFavorite && !isFavoritePath(currentPath)))
+        }
         for (index, segment) in segments.enumerated() where index < breadcrumbSegmentFrames.count {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
@@ -4366,5 +4558,89 @@ private final class FilesPreviewScrollbarDelegate: ScrollbarControllerDelegate {
 
     func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
         owner?.setPreviewScroll(offset)
+    }
+}
+
+private enum FilesEnvironment {
+    static let invalid = NSError(domain: "Files", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid environment response"])
+    static func request(url: URL, operation: UInt32, target: String, path: String) -> URLRequest? {
+        let fields = [target, "", path, "", "", ""]
+        guard !fields.contains(where: { $0.contains("\0") }) else { return nil }
+        let strings = fields.map { Data($0.utf8) }
+        let size = 72 + strings.reduce(0) { $0 + $1.count }
+        guard size <= 16 * 1024 * 1024 else { return nil }
+        var data = Data(repeating: 0, count: 72)
+        func put(_ value: UInt32, _ offset: Int) {
+            for byte in 0..<4 { data[offset + byte] = UInt8(truncatingIfNeeded: value >> (8 * byte)) }
+        }
+        put(0x51434c46, 0); put(1, 4); put(UInt32(size), 8); put(operation, 12)
+        for (index, field) in strings.enumerated() {
+            put(UInt32(data.count), 24 + index * 8); put(UInt32(field.count), 28 + index * 8)
+            data.append(field)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "X-Environment-Request")
+        request.httpBody = data
+        return request
+    }
+    static func u32(_ data: Data, _ offset: Int) throws -> UInt32 {
+        guard offset >= 0, offset <= data.count - 4 else { throw invalid }
+        return (0..<4).reduce(UInt32(0)) { $0 | UInt32(data[offset + $1]) << (8 * $1) }
+    }
+    static func u64(_ data: Data, _ offset: Int) throws -> UInt64 {
+        UInt64(try u32(data, offset)) | UInt64(try u32(data, offset + 4)) << 32
+    }
+    static func field(_ data: Data, _ offset: Int, minimum: Int) throws -> Data {
+        let start = Int(try u32(data, offset)), size = Int(try u32(data, offset + 4))
+        guard start >= minimum, start <= data.count, size <= data.count - start else { throw invalid }
+        return data.subdata(in: start..<(start + size))
+    }
+    static func string(_ data: Data, _ offset: Int, minimum: Int) throws -> String {
+        guard let string = String(data: try field(data, offset, minimum: minimum), encoding: .utf8), !string.contains("\0") else { throw invalid }
+        return string
+    }
+    static func envelope(_ data: Data) throws -> (metadata: Data, body: Data, type: String) {
+        guard data.count >= 48, try u32(data, 0) == 0x52434c46, try u32(data, 4) == 1,
+              try u32(data, 8) == data.count, try u32(data, 12) <= 1, try u32(data, 40) <= 3,
+              try u32(data, 44) == 0 else { throw invalid }
+        let message = try string(data, 32, minimum: 48)
+        if try u32(data, 12) != 0 { throw NSError(domain: "Files", code: 2, userInfo: [NSLocalizedDescriptionKey: message]) }
+        return (try field(data, 16, minimum: 48), try field(data, 24, minimum: 48), message)
+    }
+    static func list(_ bytes: Data, operation: UInt32) throws -> FileListResponse {
+        let reply = try envelope(bytes), data = reply.metadata
+        let count = Int(try u32(data, 20)), variable = Int(try u32(data, 32))
+        guard data.count >= 64, try u32(data, 0) == 0x53484c46, try u32(data, 4) == 2,
+              try u32(data, 8) == operation, try u32(data, 12) == 0, try u32(data, 16) == data.count,
+              try u32(data, 24) == 48, try u32(data, 28) == 64, variable == 64 + count * 48,
+              variable <= data.count, try u32(data, 36) == 0, try u64(data, 40) == 0, reply.body.isEmpty else { throw invalid }
+        let entries = try (0..<count).map { index -> FileEntry in
+            let o = 64 + index * 48
+            guard try u32(data, o + 24) <= 1 else { throw invalid }
+            return FileEntry(name: try string(data, o, minimum: variable), path: try string(data, o + 8, minimum: variable),
+                isDirectory: try u32(data, o + 24) == 1, size: try u64(data, o + 32), modified: Double(try u64(data, o + 40)) / 1000,
+                mode: try string(data, o + 16, minimum: variable), accessFlags: try u32(data, o + 28))
+        }
+        let parent = try string(data, 56, minimum: variable)
+        return FileListResponse(path: try string(data, 48, minimum: variable), parent: parent.isEmpty ? nil : parent, entries: entries)
+    }
+    static func targets(_ bytes: Data) throws -> (targets: [(id: String, name: String, running: Bool)], errors: [String]) {
+        let data = try envelope(bytes).metadata
+        let count = Int(try u32(data, 16)), errors = Int(try u32(data, 40)), variable = Int(try u32(data, 52))
+        guard data.count >= 80, try u32(data, 0) == 0x5054454f, try u32(data, 4) == 1,
+              try u32(data, 8) == data.count, try u32(data, 12) == 0, try u32(data, 20) == 80,
+              try u32(data, 24) == 56, try u32(data, 28) == 0,
+              try u32(data, 32) == 80 + count * 56, try u32(data, 36) == 112,
+              try u32(data, 44) == 80 + count * 56, try u32(data, 48) == 16,
+              variable == 80 + count * 56 + errors * 16, variable <= data.count else { throw invalid }
+        return (try (0..<count).map { i in
+            let o = 80 + i * 56
+            return (try string(data, o, minimum: variable), try string(data, o + 24, minimum: variable), try string(data, o + 32, minimum: variable) == "running")
+        }, try (0..<errors).map { i in
+            let o = 80 + count * 56 + i * 16
+            return try string(data, o, minimum: variable) + ": " + string(data, o + 8, minimum: variable)
+        })
     }
 }

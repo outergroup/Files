@@ -4,7 +4,7 @@ Files owns `outer-files-helper` in [Helper](Helper/README.md). The backend handl
 
 Container images must install `/usr/local/bin/outer-files-helper`. The bundled base images include each app's separate executable. Custom images can COPY the app's static helper directly. Release, deployment and development scripts build it from this app's Helper directory. The container process exits when its backend connection closes; it is not a separately managed daemon.
 
-The HTML frontend uses the container-aware APIs. Outerframe behavior is unchanged. Docker is tested; Apple container/wslc still require live validation. Native Windows backend integration remains separate.
+Both HTML and Outerframe use the container-aware APIs for folder listings, places, previews, and Plaintext openers. Outerframe also supports copying and dragging individual container files out; uploading into containers and dragging whole container folders remain unsupported. Docker is tested; Apple container/wslc still require live validation. Native Windows backend integration remains separate.
 
 On macOS, discovery refreshes the user’s launchd API socket after Outer Shell restarts. Root Files discovers user registries and validates each user’s local Docker socket. The system daemon has no default container provider; explicit custom registry sockets remain supported.
 

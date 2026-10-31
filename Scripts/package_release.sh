@@ -11,6 +11,7 @@ PACKAGE_ROOT="${PACKAGE_ROOT:-${REPO_ROOT}/build/linux-package}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/build/release}"
 CONFIGURATION="${CONFIGURATION:-Release}"
 APP_CODESIGN_IDENTITY="${APP_CODESIGN_IDENTITY:-${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}}"
+APP_NOTARY_PROFILE="${APP_NOTARY_PROFILE:-${OUTER_SHELL_NOTARY_PROFILE:-}}"
 
 require_file() {
     if [[ ! -f "$1" ]]; then
@@ -47,6 +48,24 @@ sign_macos_app() {
     /usr/bin/codesign "${args[@]}" "$path" >/dev/null
 }
 
+notarize_macos_app_if_requested() {
+    local path="$1"
+    if [[ -z "${APP_NOTARY_PROFILE}" ]]; then
+        return 0
+    fi
+    if [[ "${APP_CODESIGN_IDENTITY}" == "-" ]]; then
+        echo "error: APP_NOTARY_PROFILE requires APP_CODESIGN_IDENTITY" >&2
+        exit 1
+    fi
+    local archive="${STAGING_ROOT}/$(basename "$path" .app)-notarize.zip"
+    /usr/bin/ditto -c -k --norsrc --keepParent "$path" "$archive"
+    xcrun notarytool submit "$archive" \
+        --keychain-profile "${APP_NOTARY_PROFILE}" \
+        --wait
+    xcrun stapler staple "$path"
+    rm -f "$archive"
+}
+
 echo "==> Building FilesBackend for macOS"
 cc -std=gnu17 -Wall -Wextra -O2 \
     -arch arm64 -arch x86_64 \
@@ -69,7 +88,8 @@ echo "==> Building Files frontend"
     build
 
 echo "==> Archiving FilesContent bundles"
-"${REPO_ROOT}/Scripts/archive_files_bundle.sh" \
+APP_CODESIGN_IDENTITY="${APP_CODESIGN_IDENTITY}" APP_NOTARY_PROFILE="${APP_NOTARY_PROFILE}" \
+    "${REPO_ROOT}/Scripts/archive_files_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Files.bundle" \
     "${PACKAGE_ROOT}/bundles" \
     FilesContent.bundle
@@ -154,6 +174,7 @@ package_macos_variant() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${macos_app_root}/Contents/Resources/app-icon.png"
     write_info_plist "${macos_app_root}"
     sign_macos_app "${macos_app_root}"
+    notarize_macos_app_if_requested "${macos_app_root}"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }

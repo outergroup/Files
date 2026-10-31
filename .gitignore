@@ -49,3 +49,7 @@ target.env
 *.swp
 *.swo
 *~
+
+__pycache__/
+
+!Windows/FilesBackend.c

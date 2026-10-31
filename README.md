@@ -67,7 +67,7 @@ publishing should live outside this repository.
 
 ## Favorites
 
-On the host, use **Add to Favorites** beside the current folder path, or
+In either the HTML or Outerframe app, on the host, use **Add to Favorites** beside the current folder path, or
 right-click a folder and choose **Add to Favorites**. Saved folders appear in
 the places bar immediately and persist across restarts. Existing favorites
 show **In Favorites** to prevent duplicates.
@@ -113,3 +113,11 @@ user's launchd session before invoking Apple Container. Helper image builds acce
 builder. `Scripts/test_runtime_command.c` tests the command contract, including
 `wslc.exe`; Windows still needs native process transport integration and live
 validation. `wslc` is not treated as a `wsl.exe` distribution.
+
+
+## Windows
+
+Windows host folders, known-folder places and favorites, previews, and Docker/WSLc container browsing use the native named-pipe backend. Plaintext opening preserves the selected container target.
+Build and packaging are integrated in `../Backends/Windows/build.ps1`; install the
+app through Outer Shell’s Add Apps experience. The package includes HTML content
+and macOS native outerframe bundles.
