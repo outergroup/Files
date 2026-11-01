@@ -101,8 +101,16 @@ OUTPUT_APP_ROOT="${OUTPUT_ROOT}/Files"
 rm -rf "${OUTPUT_APP_ROOT}"
 mkdir -p "${OUTPUT_APP_ROOT}"
 
+echo "==> Building container helpers"
+for helper_arch in x86_64 aarch64; do
+    mkdir -p "${PACKAGE_ROOT}/helpers/linux-${helper_arch}"
+    "${REPO_ROOT}/Helper/build.sh" linux "${helper_arch}" "${PACKAGE_ROOT}/helpers/linux-${helper_arch}/outer-files-helper"
+done
+
 install_shared_resources() {
     local app_root="$1"
+    rm -rf "${app_root}/helpers"
+    cp -R "${PACKAGE_ROOT}/helpers" "${app_root}/helpers"
     mkdir -p "${app_root}/bundles" "${app_root}/web"
     install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-arm.aar" "${app_root}/bundles/FilesContent.bundle.macos-arm.aar"
     install -m 0644 "${PACKAGE_ROOT}/bundles/FilesContent.bundle.macos-x86.aar" "${app_root}/bundles/FilesContent.bundle.macos-x86.aar"

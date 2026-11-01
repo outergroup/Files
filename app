@@ -201,8 +201,14 @@ cmd_build_frontend() {
     require_tool aa
     require_tool lipo
 
-    rm -rf "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web"
+    rm -rf "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web" "${STAGE_ROOT}/helpers"
     mkdir -p "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web"
+    echo "==> Building container helpers"
+    local helper_arch
+    for helper_arch in x86_64 aarch64; do
+        mkdir -p "${STAGE_ROOT}/helpers/linux-${helper_arch}"
+        "${ROOT}/Helper/build.sh" linux "${helper_arch}" "${STAGE_ROOT}/helpers/linux-${helper_arch}/outer-files-helper"
+    done
     echo "==> Building ${APP_NAME} frontend"
     /usr/bin/xcodebuild \
         -project "${ROOT}/${XCODE_PROJECT}" \
@@ -251,6 +257,7 @@ build_local_backend() {
     local contents="${app_bundle}/Contents"
     local resources="${contents}/Resources"
     mkdir -p "${contents}/MacOS" "${resources}/bundles" "${resources}/web"
+    cp -R "${STAGE_ROOT}/helpers" "${resources}/helpers"
     install -m 0755 "${backend}" "${contents}/MacOS/${BACKEND_EXECUTABLE_NAME}"
     install -m 0644 "${STAGE_ROOT}/bundles/${BUNDLE_ARCHIVE_STEM}.macos-arm.aar" \
         "${resources}/bundles/${BUNDLE_ARCHIVE_STEM}.macos-arm.aar"

@@ -53,6 +53,7 @@ def gone(pids):
 
 with tempfile.TemporaryDirectory(prefix='app-helper-',dir='/tmp') as temp:
  root=pathlib.Path(temp);web=root/'web';web.mkdir()
+ (root/'helpers'/'linux-x86_64').mkdir(parents=True);(root/'helpers'/'linux-x86_64'/('outer-'+APP.lower()+'-helper')).write_bytes(pathlib.Path(HELPER).read_bytes())
  (web/'environment.js').write_text('test')
  target='a'*64;row=['test','Container',PROVIDER,target,'running','test','','','registered-name']
  registry=RegistryServer(root/'registry.sock',lambda:encode([row]))
@@ -62,10 +63,21 @@ if args[:1]==['--host']:args=args[2:]
 assert args[:2] in (['exec','-i'],['exec','--interactive']),args
 args=args[2:]
 if args[:1]==['--user']:args=args[2:]
-assert args[1:] == ['/usr/local/bin/outer-APP_LOWER-helper','serve'],args
+assert args[1:3]==['/bin/sh','-c'] and args[4:7]==['outer-container-helper','org.outershell.APP_NAME','outer-APP_LOWER-helper'] and args[11:]==['serve'],args
+import hashlib
+uploaded=pathlib.Path(os.environ['TEST_EXEC_LOG']).with_name('uploaded')
+if uploaded.exists():os.write(1,b'R\\n')
+else:
+ os.write(1,b'U x86_64\\n');size=int(args[8]);data=b''
+ while len(data)<size:
+  part=os.read(0,size-len(data))
+  if not part:raise EOFError()
+  data+=part
+ assert hashlib.sha256(data).hexdigest()==args[7]
+ uploaded.touch()
 with open(os.environ['TEST_EXEC_LOG'],'a') as f:f.write(str(os.getpid())+'\\n')
 os.execv(os.environ['TEST_HELPER'],[os.environ['TEST_HELPER'],'serve'])
-'''.replace('APP_LOWER',APP.lower()));runtime.chmod(0o755)
+'''.replace('APP_LOWER',APP.lower()).replace('APP_NAME',APP));runtime.chmod(0o755)
  env=dict(os.environ,PATH=str(root)+':'+os.environ.get('PATH',''),OUTERSHELLD_API_SOCKET=registry.path,
           TEST_HELPER=HELPER,TEST_EXEC_LOG=str(root/'executions'),XDG_STATE_HOME=str(root/'state'))
  file=root/'document.txt';file.write_text('original café')

@@ -1,6 +1,6 @@
 # Files helper
 
-`outer-files-helper` belongs to Files; source and protocol evolve in this repository. It does not run as an Outer Shell service. Install it at `/usr/local/bin/outer-files-helper` in container images. Build with `Helper/build.sh OS ARCH OUTPUT`. Linux builds are static musl; macOS uses the native compiler. No Python or Go runtime is needed.
+`outer-files-helper` belongs to Files; source and protocol evolve in this repository. It does not run as an Outer Shell service. The app copies it into containers when needed; see `Backend/Environment/ContainerHelper.h`, which comes from Outer Shell. Build with `Helper/build.sh OS ARCH OUTPUT`. Linux builds are static musl; macOS uses the native compiler. No Python or Go runtime is needed.
 
 The backend links `Backend/Environment.c` directly. Discovery, connection management, local operations and directory browsing run in the backend process. Host-only implementation lives in `Backend/Environment/`; common protocol and local-operation code is compiled from Helper. There is no host-helper process, host mode, or backend-to-host-helper protocol.
 

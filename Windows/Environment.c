@@ -1,6 +1,7 @@
 #define APP_FILES 1
 #define HELPER_CAPABILITIES 515u
-#define HELPER_PATH "/usr/local/bin/outer-files-helper"
+#define HELPER_APP_ID "org.outershell.Files"
+#define HELPER_NAME "outer-files-helper"
 #define APP_FRAME_MAGIC "FLH2"
 #include "AppEnvironment.h"
 #include "../Helper/binary.c"

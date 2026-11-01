@@ -1,4 +1,42 @@
 #include "RuntimeCommand.h"
+#include "ContainerHelper.h"
+static char helper_directory[4096] = "helpers";
+static ContainerHelper helper_files;
+static bool helper_files_loaded;
+void environment_set_web_root(const char *web_root) {
+    snprintf(helper_directory, sizeof(helper_directory), "%s/../helpers", web_root);
+    helper_files_loaded = container_helper_load(&helper_files, HELPER_APP_ID, HELPER_NAME, helper_directory);
+}
+// Appends the command that runs this app's helper in a container. Once it has
+// started, helper_handshake() uploads the helper if the container needs it.
+static size_t helper_command(char **args, size_t count, size_t capacity, const char *const *helper_args) {
+    if (!helper_files_loaded) {
+        fail("This app's container helpers are missing from %s.", helper_directory);
+        return 0;
+    }
+    return container_helper_command(&helper_files, (const char **)args, count, capacity, helper_args);
+}
+static bool helper_handshake(Child *child) {
+    char line[512], message[512];
+    size_t used = 0;
+    bool eof;
+    for (;;) {
+        if (used + 1 == sizeof(line) || !read_all(child->output, line + used, 1, &eof)) {
+            fail("The container helper could not start.");
+            return false;
+        }
+        if (line[used] == '\n') break;
+        used++;
+    }
+    line[used] = 0;
+    int architecture = 0;
+    int reply = container_helper_reply(line, &architecture, message, sizeof(message));
+    if (!reply) {
+        fail("%s", message);
+        return false;
+    }
+    return reply == 1 || write_all(child->input, helper_files.data[architecture], helper_files.length[architecture]);
+}
 #ifdef __APPLE__
 static Bytes registry_command(char *const *args, double timeout) {
     Bytes b = {0};
@@ -476,15 +514,18 @@ static BinaryReply target_operation(const EnvironmentTarget *target, const char 
     }
     for (int attempt = 0; attempt < 1; attempt++) {
         if (!session->key) {
-            char *args[16];
-            if (!app_runtime_exec(app_runtime(target->runtime), target->executable,
-                                  target->socket, user, target->container, HELPER_PATH, args, 16)) {
+            char *args[32];
+            const char *serve[] = {"serve", NULL};
+            size_t count = app_runtime_exec_prefix(app_runtime(target->runtime), target->executable,
+                                                   target->socket, user, target->container, args, 32);
+            if (!count) {
                 fail("Unsupported container runtime execution configuration.");
                 break;
             }
+            if (!helper_command(args, count, 32, serve)) break;
             char **command_args = args;
 #ifdef __APPLE__
-            char *owner_args[24], owner_id[32], owner_user[32];
+            char *owner_args[48], owner_id[32], owner_user[32];
             if (geteuid() == 0 && target->owner_uid != 0 && app_runtime(target->runtime) == APP_RUNTIME_APPLE) {
                 snprintf(owner_id, sizeof(owner_id), "%u", (unsigned)target->owner_uid);
                 snprintf(owner_user, sizeof(owner_user), "#%u", (unsigned)target->owner_uid);
@@ -498,13 +539,14 @@ static BinaryReply target_operation(const EnvironmentTarget *target, const char 
 #endif
             if (!spawn(command_args, &session->child)) { *connection_failed = true; break; }
             session->key = strdup(key); session->target_id = strdup(target->id); session->next_id = 1;
+            if (!helper_handshake(&session->child)) { *connection_failed = true; session_close(session); break; }
             uint32_t kind = 0, id = 0; Bytes hello = {0}; bool eof;
             bool ok = frame_read(session->child.output, &kind, &id, &hello, &eof) && kind == 1 && id == 0 &&
                       hello.size == 16 && get_u32(hello.data) == 2 && get_u32(hello.data + 4) == HELPER_CAPABILITIES &&
                       get_u32(hello.data + 8) == MAX_DATA && get_u32(hello.data + 12) == MAX_FRAME;
             bytes_free(&hello);
             if (!ok) {
-                fail("Container helper unavailable or incompatible; install " HELPER_NAME " in the container image.");
+                fail("The container helper is incompatible with this app.");
                 *connection_failed = true; session_close(session); break;
             }
         }

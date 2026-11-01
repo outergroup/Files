@@ -2166,6 +2166,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    environment_set_web_root(g_web_root[0] ? g_web_root : "web");
     if (!use_port && !socket_path[0]) {
         default_socket_path(socket_path, sizeof(socket_path));
     }
