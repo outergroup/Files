@@ -1713,20 +1713,23 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     label.frame = addFavoriteFrame.insetBy(dx: 4, dy: 4)
                     breadcrumbBarLayer.addSublayer(label)
                 }
-                let name = environmentTargets.first { $0.id == environmentTarget }?.name ?? (environmentTarget == "host" ? "Host" : "Unavailable container")
-                let title = (environmentTarget == "host" ? "Host — " : "") + name + " ▾"
-                let width = min(textWidth(title, fontSize: 13, weight: .medium) + 24, 260)
-                environmentFrame = CGRect(x: horizontalInset, y: 6, width: width, height: 24)
-                let button = CALayer()
-                button.frame = environmentFrame
-                button.cornerRadius = 6
-                button.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
-                let label = makeTextLayer(size: 13, weight: .medium)
-                label.string = title
-                label.frame = CGRect(x: 10, y: 4, width: width - 20, height: 17)
-                button.addSublayer(label)
-                breadcrumbBarLayer.addSublayer(button)
-                var x = environmentFrame.maxX + 12
+                environmentFrame = .zero
+                var x = horizontalInset
+                if showsEnvironmentPicker {
+                    let title = environmentName + " ▾"
+                    let width = min(textWidth(title, fontSize: 13, weight: .medium) + 24, 260)
+                    environmentFrame = CGRect(x: horizontalInset, y: 6, width: width, height: 24)
+                    let button = CALayer()
+                    button.frame = environmentFrame
+                    button.cornerRadius = 6
+                    button.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+                    let label = makeTextLayer(size: 13, weight: .medium)
+                    label.string = title
+                    label.frame = CGRect(x: 10, y: 4, width: width - 20, height: 17)
+                    button.addSublayer(label)
+                    breadcrumbBarLayer.addSublayer(button)
+                    x = environmentFrame.maxX + 12
+                }
                 let segments = breadcrumbSegments()
                 for (index, segment) in segments.enumerated() {
                     if index > 0 {
@@ -1838,6 +1841,15 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         loadPlaces()
     }
 
+    private var showsEnvironmentPicker: Bool {
+        environmentTarget != "host" || environmentTargets.contains { $0.id != "host" }
+    }
+
+    private var environmentName: String {
+        if environmentTarget == "host" { return "Host" }
+        return environmentTargets.first { $0.id == environmentTarget }?.name ?? "Unavailable container"
+    }
+
     private func discoverEnvironments(completion: (() -> Void)? = nil) {
         guard let request = environmentRequest(operation: 7, path: "", target: "host"), let session = urlSession else { return }
         Task {
@@ -1860,7 +1872,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             let id = UUID()
             environmentMenuID = id
             outerframeHost.showContextMenu(menuID: id, items: environmentTargets.map {
-                OuterframeContextMenuItem(id: $0.id, title: ($0.id == "host" ? "Host — " : "") + $0.name + ($0.running ? "" : " · Stopped"), isEnabled: $0.running)
+                OuterframeContextMenuItem(id: $0.id, title: ($0.id == "host" ? "Host" : $0.name) + ($0.running ? "" : " · Stopped"), isEnabled: $0.running)
             }, at: point)
         }
     }
@@ -4414,8 +4426,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func buildBreadcrumbAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
         let segments = breadcrumbSegments()
         var nodes: [OuterframeAccessibilityNode] = []
-        nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button,
-            frame: breadcrumbBarLayer.convert(environmentFrame, to: rootLayer), label: "Location: " + (environmentTargets.first { $0.id == environmentTarget }?.name ?? environmentTarget), value: "files:environment"))
+        if showsEnvironmentPicker {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button,
+                frame: breadcrumbBarLayer.convert(environmentFrame, to: rootLayer), label: "Location: " + environmentName, value: "files:environment"))
+        }
         if environmentTarget == "host" {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button,
                 frame: breadcrumbBarLayer.convert(addFavoriteFrame, to: rootLayer), label: isFavoritePath(currentPath) ? "In Favorites" : "Add to Favorites", value: "files:add-favorite", isEnabled: !isLoading && !savingFavorite && !isFavoritePath(currentPath)))

@@ -18,9 +18,9 @@ async function environment(operation, values = {}, options = {}) {
 }
 async function discoverEnvironments(){
  const select=$('#environment');select.disabled=true;
- try{const result=await environment('targets');select.replaceChildren(...result.targets.map(t=>{const o=document.createElement('option');o.value=t.id;o.textContent=t.id==='host'?`Host — ${t.name}`:t.name+(t.state==='running'?'':` · ${t.state}`);o.dataset.name=t.name;o.disabled=t.state!=='running';return o}));
+ try{const result=await environment('targets');select.replaceChildren(...result.targets.map(t=>{const o=document.createElement('option');o.value=t.id;const name=t.id==='host'?'Host':t.name;o.textContent=name+(t.state==='running'?'':` · ${t.state}`);o.dataset.name=name;o.disabled=t.state!=='running';return o}));
  if(!result.targets.some(t=>t.id===state.target)){const o=new Option('Unavailable container',state.target);select.append(o)}
- select.value=state.target;updateEnvironmentName();$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');
+ select.value=state.target;updateEnvironmentName();const showPicker=state.target!=='host'||result.targets.some(t=>t.id!=='host');$('.location-picker').hidden=!showPicker;$('.location-picker+.separator').hidden=!showPicker;$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');
  }catch(e){$('#environment-errors').textContent=e.message}finally{select.disabled=false}
 }
 function isFavorite(path){return state.placesTarget===state.target&&state.places.some(place=>place.path===path)}

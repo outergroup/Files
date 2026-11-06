@@ -27,4 +27,4 @@
 .add-favorite{margin-left:auto;color:var(--accent)}
 .add-favorite:disabled,.menu button:disabled{color:var(--muted);cursor:default}
 .add-favorite:disabled:hover,.menu button:disabled:hover{background:transparent;color:var(--muted)}
-.add-favorite[hidden]{display:none}
+.add-favorite[hidden],.location-picker[hidden],.crumbs>.separator[hidden]{display:none}
