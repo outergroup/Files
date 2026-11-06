@@ -370,6 +370,7 @@ private extension Data {
 private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private static let droppedFileAccessPasteboardTypeIdentifier = "org.outerframe.dropped-file-access"
 
+    private lazy var elasticScrolling = ElasticScrollController(host: outerframeHost)
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: FilesHandler?
@@ -552,21 +553,22 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             self.appearance = appearance
             updateColors()
 
-        case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
-            if previewPaneLayer.frame.contains(point),
-               previewClipLayer.bounds.contains(previewClipLayer.convert(point, from: rootLayer)) {
+        case .scrollWheelEvent(let point, let delta, _, let phase, let momentumPhase, let hasPreciseScrollingDeltas):
+            if elasticScrolling.isActive("preview") || (previewPaneLayer.frame.contains(point) &&
+               previewClipLayer.bounds.contains(previewClipLayer.convert(point, from: rootLayer))) {
                 let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
-                setPreviewScroll(previewScrollOffset - delta.y * multiplier)
+                setPreviewScroll(elasticScrolling.scroll("preview", by: -delta.y * multiplier, offset: previewScrollOffset, maximum: max(previewContentHeight() - previewClipLayer.bounds.height, 0), viewport: previewClipLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.previewTextContentLayer] } ?? [] })
                 return
             }
-            guard rowsClipLayer.frame.contains(rootLayer.convert(point, to: rowsClipLayer.superlayer)) else { return }
+            guard elasticScrolling.isActive("rows") || rowsClipLayer.frame.contains(rootLayer.convert(point, to: rowsClipLayer.superlayer)) else { return }
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
-            setRowsScroll(scrollOffset - delta.y * multiplier)
+            setRowsScroll(elasticScrolling.scroll("rows", by: -delta.y * multiplier, offset: scrollOffset, maximum: max(rowsContentHeight() - rowsClipLayer.bounds.height, 0), viewport: rowsClipLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.rowsContentLayer] } ?? [] })
 
         case .mouseMoved(let point, _):
             updateCursor(at: point)
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            let point = elasticScrolling.finish(at: point, in: rootLayer)
             if modifierFlags.contains(.control) {
                 suppressNextMouseUpAfterControlClick = true
                 handleRightMouseDown(at: point)
@@ -589,6 +591,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             handleRightMouseDown(at: point)
 
         case .keyDown(let keyCode, let characters, _, _, _):
+            elasticScrolling.reset()
             handleKeyDown(keyCode: keyCode, characters: characters)
 
         case .selectionToPasteboardCopyRequest(let requestID):
@@ -642,6 +645,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                              snapshot: buildAccessibilitySnapshot())
 
         case .shutdown:
+            elasticScrolling.reset()
             stopPreviewChangeMonitoring()
             retainedSelf = nil
 
@@ -651,6 +655,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        elasticScrolling.reset()
         stopPreviewChangeMonitoring()
         retainedSelf = nil
     }

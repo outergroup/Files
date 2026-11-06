@@ -20,6 +20,13 @@ require_file() {
     fi
 }
 
+require_file "${REPO_ROOT}/VERSION"
+APP_VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
+if [[ ! "${APP_VERSION}" =~ ^[0-9A-Za-z.+_-]+$ ]]; then
+    echo "error: ${REPO_ROOT}/VERSION must hold a version such as 1.1.0" >&2
+    exit 1
+fi
+
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/FilesBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/FilesBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/aarch64/FilesBackend"
@@ -125,7 +132,7 @@ install_shared_resources() {
 
 write_info_plist() {
     local app_bundle="$1"
-    cat > "${app_bundle}/Contents/Info.plist" <<'__FILES_INFO_PLIST__'
+    cat > "${app_bundle}/Contents/Info.plist" <<__FILES_INFO_PLIST__
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -139,9 +146,9 @@ write_info_plist() {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${APP_VERSION}</string>
     <key>LSBackgroundOnly</key>
     <true/>
 </dict>
@@ -160,6 +167,7 @@ package_linux_variant() {
     mkdir -p "${app_root}/${binary_directory}/${arch}"
     install_shared_resources "${app_root}"
     install -m 0755 "${PACKAGE_ROOT}/${binary_directory}/${arch}/FilesBackend" "${app_root}/${binary_directory}/${arch}/FilesBackend"
+    printf '%s\n' "${APP_VERSION}" > "${app_root}/version"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
@@ -183,6 +191,7 @@ package_macos_variant() {
     write_info_plist "${macos_app_root}"
     sign_macos_app "${macos_app_root}"
     notarize_macos_app_if_requested "${macos_app_root}"
+    printf '%s\n' "${APP_VERSION}" > "${app_root}/version"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Files
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
