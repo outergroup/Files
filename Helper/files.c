@@ -101,13 +101,14 @@ static BinaryReply list_files(const char *path) {
     return result;
 }
 
-static void place_add(FileEntry **rows, size_t *count, const char *path, const char *name) {
+static void place_add(FileEntry **rows, size_t *count, const char *path, const char *name, bool personal) {
     char resolved[PATH_MAX];
     struct stat st;
     if (!realpath(path, resolved) || stat(resolved, &st) || !S_ISDIR(st.st_mode)) return;
     for (size_t i = 0; i < *count; i++) {
         if (!strcmp((*rows)[i].path, resolved)) {
             if (name && *name) { free((*rows)[i].name); (*rows)[i].name = strdup(name); }
+            if (personal) strcpy((*rows)[i].mode, "favorite");
             return;
         }
     }
@@ -116,8 +117,10 @@ static void place_add(FileEntry **rows, size_t *count, const char *path, const c
     if (!next) { fail("out of memory"); return; }
     *rows = next;
     const char *base = strrchr(resolved, '/');
-    next[(*count)++] = (FileEntry){.path = strdup(resolved),
+    next[*count] = (FileEntry){.path = strdup(resolved),
         .name = strdup(name && *name ? name : base && base[1] ? base + 1 : resolved)};
+    if (personal) strcpy(next[*count].mode, "favorite");
+    (*count)++;
 }
 #ifdef __linux__
 static void mount_path_decode(char *path) {
@@ -158,7 +161,7 @@ static bool personal_places_path(char path[PATH_MAX], bool create) {
     return true;
 }
 
-static void read_places(const char *path, FileEntry **rows, size_t *count) {
+static void read_places(const char *path, FileEntry **rows, size_t *count, bool personal) {
     FILE *config = fopen(path, "r");
     if (config) {
         char *line = NULL; size_t capacity = 0;
@@ -168,7 +171,7 @@ static void read_places(const char *path, FileEntry **rows, size_t *count) {
             char *label = strchr(line, '\t');
             if (!label) continue;
             *label++ = 0;
-            place_add(rows, count, line, label);
+            place_add(rows, count, line, label, personal);
         }
         free(line); fclose(config);
     }
@@ -217,11 +220,61 @@ static BinaryReply add_place(const char *path) {
     return reply;
 }
 
+/* Removes every line of the personal favorites file that names `path`, directly or through a symbolic link. */
+static BinaryReply remove_place(const char *path) {
+    BinaryReply reply = {0};
+    char resolved[PATH_MAX], config[PATH_MAX];
+    if (!realpath(path, resolved)) snprintf(resolved, sizeof(resolved), "%s", path);
+    if (!personal_places_path(config, false)) return reply;
+    int fd = open(config, O_RDWR | O_NOFOLLOW);
+    if (fd < 0) {
+        if (errno == ENOENT) fail("This folder is not in your Favorites");
+        else fail("Cannot open favorites: %s", strerror(errno));
+        return reply;
+    }
+    if (flock(fd, LOCK_EX)) { fail("Cannot lock favorites: %s", strerror(errno)); close(fd); return reply; }
+    FILE *file = fdopen(fd, "r+");
+    if (!file) { fail("Cannot read favorites: %s", strerror(errno)); close(fd); return reply; }
+    char *line = NULL, *kept = NULL; size_t capacity = 0, kept_length = 0; bool found = false;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, file)) >= 0) {
+        char entry[PATH_MAX], existing[PATH_MAX];
+        size_t path_length = strcspn(line, "\t\r\n");
+        bool matches = false;
+        if (line[path_length] == '\t' && path_length < sizeof(entry)) {
+            memcpy(entry, line, path_length);
+            entry[path_length] = 0;
+            matches = !strcmp(entry, resolved) || !strcmp(entry, path) ||
+                (realpath(entry, existing) && !strcmp(existing, resolved));
+        }
+        if (matches) { found = true; continue; }
+        char *grown = realloc(kept, kept_length + (size_t)length + 1);
+        if (!grown) { fail("out of memory"); break; }
+        kept = grown;
+        memcpy(kept + kept_length, line, (size_t)length);
+        kept_length += (size_t)length;
+    }
+    free(line);
+    if (!failure[0] && ferror(file)) fail("Cannot read favorites: %s", strerror(errno));
+    if (!failure[0] && !found) fail("This folder is not in your Favorites");
+    if (!failure[0]) {
+        if (fseek(file, 0, SEEK_SET) || (kept_length && fwrite(kept, 1, kept_length, file) != kept_length) ||
+            fflush(file) || ftruncate(fd, (off_t)kept_length) || fsync(fd)) fail("Cannot save favorites: %s", strerror(errno));
+    }
+    free(kept);
+    if (fclose(file) && !failure[0]) fail("Cannot close favorites: %s", strerror(errno));
+    if (!failure[0]) {
+        reply = response_create(OP_REMOVE_PLACE, 0, 0);
+        binary_string(&reply.metadata, 48, resolved);
+    }
+    return reply;
+}
+
 static BinaryReply list_places(void) {
     FileEntry *rows = NULL;
     size_t count = 0;
     char home[PATH_MAX];
-    if (expand_path("~", home)) place_add(&rows, &count, home, "Home");
+    if (expand_path("~", home)) place_add(&rows, &count, home, "Home", false);
 #ifdef __linux__
     FILE *mounts = fopen("/proc/self/mountinfo", "r");
     if (mounts) {
@@ -235,20 +288,20 @@ static BinaryReply list_places(void) {
                 !strcmp(field, "/sys") || !strncmp(field, "/sys/", 5) ||
                 !strcmp(field, "/dev") || !strncmp(field, "/dev/", 5) ||
                 !strcmp(field, "/var/lib/outershell") || !strncmp(field, "/var/lib/outershell/", sizeof("/var/lib/outershell/") - 1)) continue;
-            place_add(&rows, &count, field, NULL);
+            place_add(&rows, &count, field, NULL, false);
         }
         free(line); fclose(mounts);
     }
 #endif
-    read_places("/etc/outer-files/places.tsv", &rows, &count);
+    read_places("/etc/outer-files/places.tsv", &rows, &count, false);
     char personal[PATH_MAX];
-    if (personal_places_path(personal, false)) read_places(personal, &rows, &count);
+    if (personal_places_path(personal, false)) read_places(personal, &rows, &count, true);
     BinaryReply reply = response_create(OP_PLACES, (uint32_t)count, FILE_ROW_SIZE);
     for (size_t i = 0; i < count; i++) {
         size_t offset = RESPONSE_SIZE + i * FILE_ROW_SIZE;
         binary_string(&reply.metadata, offset, rows[i].name);
         binary_string(&reply.metadata, offset + 8, rows[i].path);
-        binary_string(&reply.metadata, offset + 16, "");
+        binary_string(&reply.metadata, offset + 16, rows[i].mode);
         put_u32(reply.metadata.data + offset + 24, 1);
         free(rows[i].name); free(rows[i].path);
     }
@@ -269,6 +322,9 @@ BinaryReply local_binary_operation(const Request *request, Bytes body) {
     switch (op) {
     case OP_ADD_PLACE:
         r = add_place(path);
+        break;
+    case OP_REMOVE_PLACE:
+        r = remove_place(path);
         break;
     case OP_PLACES:
         r = list_places();

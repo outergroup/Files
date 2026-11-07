@@ -40,6 +40,19 @@ with tempfile.TemporaryDirectory(prefix='files-favorites-') as temporary:
         results = list(pool.map(lambda _: call('addPlace', path=str(other)), range(8)))
     assert all(result.get('ok') for result in results)
     assert config.read_text().splitlines() == [f'{folder}\t{folder.name}', f'{other}\tOther']
+    places = call('places')['entries']
+    assert all(p['mode'] == 'favorite' for p in places if p['path'] in (str(folder), str(other)))
+    assert all(p['mode'] == '' for p in places if p['name'] == 'Home')
+    assert 'error' in call('removePlace', target='docker-user:abc', path=str(folder))
+    assert call('removePlace', path=str(alias))['ok']
+    assert config.read_text().splitlines() == [f'{other}\tOther']
+    assert 'error' in call('removePlace', path=str(folder))
+    other.rmdir()
+    assert call('removePlace', path=str(other))['ok']
+    assert config.read_text() == ''
+    assert call('addPlace', path=str(folder))['ok']
+    assert config.read_text() == f'{folder}\t{folder.name}\n'
     env['XDG_CONFIG_HOME'] = str(file)
     assert 'error' in call('addPlace', path=str(folder))
-print('PASS favorites persistence across processes, canonical duplicates, concurrent writes, TSV validation, host scope and write errors')
+    assert 'error' in call('removePlace', path=str(folder))
+print('PASS favorites persistence across processes, canonical duplicates, concurrent writes, TSV validation, removal, host scope and write errors')

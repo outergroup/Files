@@ -183,9 +183,42 @@ private struct BreadcrumbSegment {
     let path: String
 }
 
+/// Query values follow HTML form rules, as the Files backend and the HTML app's URLSearchParams do: "+" reads as
+/// a space. Values are written with %20 for a space and %2B for "+", which every parser reads the same way.
+private extension URLComponents {
+    var formQueryItems: [URLQueryItem]? {
+        get {
+            percentEncodedQueryItems?.map {
+                URLQueryItem(name: Self.formDecoded($0.name), value: $0.value.map(Self.formDecoded))
+            }
+        }
+        set {
+            percentEncodedQueryItems = newValue?.map {
+                URLQueryItem(name: Self.formEncoded($0.name), value: $0.value.map(Self.formEncoded))
+            }
+        }
+    }
+
+    private static let formValueAllowed: CharacterSet = {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "+&=")
+        return allowed
+    }()
+
+    private static func formEncoded(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: formValueAllowed) ?? value
+    }
+
+    private static func formDecoded(_ value: String) -> String {
+        let spaced = value.replacingOccurrences(of: "+", with: " ")
+        return spaced.removingPercentEncoding ?? spaced
+    }
+}
+
 private struct FavoriteLocation: Sendable {
     let title: String
     let path: String
+    let isRemovable: Bool
 }
 
 private struct DroppedFileAccessPayload: Sendable {
@@ -443,6 +476,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private var visibleRowLayers: [Int: CALayer] = [:]
     private var reusableRowLayers: [CALayer] = []
     private var pendingDirectoryMenuEntries: [UUID: FileEntry] = [:]
+    private var pendingFavoriteMenuPaths: [UUID: String] = [:]
     private var pendingOpenMenuEntries: [UUID: (entry: FileEntry, openers: [FileOpener])] = [:]
     private var resizeLayoutUpdateScheduled = false
     private var accessibilityNotificationScheduled = false
@@ -1708,8 +1742,8 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 if environmentTarget == "host" {
                     addFavoriteFrame = CGRect(x: max(horizontalInset, breadcrumbBarLayer.bounds.width - 150), y: 5, width: 140, height: 24)
                     let label = makeTextLayer(size: 13, weight: .medium)
-                    label.string = isFavoritePath(currentPath) ? "In Favorites" : "Add to Favorites"
-                    label.foregroundColor = (isFavoritePath(currentPath) || savingFavorite || isLoading ? NSColor.secondaryLabelColor : NSColor.controlAccentColor).cgColor
+                    label.string = favoriteButtonTitle(for: currentPath)
+                    label.foregroundColor = (!canToggleFavorite(currentPath) ? NSColor.secondaryLabelColor : NSColor.controlAccentColor).cgColor
                     label.frame = addFavoriteFrame.insetBy(dx: 4, dy: 4)
                     breadcrumbBarLayer.addSublayer(label)
                 }
@@ -1812,7 +1846,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func targetFromURL(_ string: String?) -> String {
-        string.flatMap { URLComponents(string: $0)?.queryItems?.first { $0.name == "target" }?.value } ?? "host"
+        string.flatMap { URLComponents(string: $0)?.formQueryItems?.first { $0.name == "target" }?.value } ?? "host"
     }
 
     private func environmentRequest(operation: UInt32, path: String, target: String? = nil) -> URLRequest? {
@@ -1832,6 +1866,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         entries = []
         selectedIndex = nil
         pendingDirectoryMenuEntries.removeAll()
+        pendingFavoriteMenuPaths.removeAll()
         pendingOpenMenuEntries.removeAll()
         clearPreviewPane()
         updatePasteboardCapabilities()
@@ -1885,7 +1920,9 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 let (data, _) = try await session.data(for: request)
                 let result = try FilesEnvironment.list(data, operation: 10)
                 guard environmentTarget == target else { return }
-                favoriteLocations = result.entries.map { FavoriteLocation(title: $0.name, path: $0.path) }
+                favoriteLocations = result.entries.map {
+                    FavoriteLocation(title: $0.name, path: $0.path, isRemovable: $0.mode == "favorite")
+                }
                 updateFavoritesBar()
                 updateBreadcrumbBar()
                 notifyAccessibilityLayoutChanged()
@@ -1908,10 +1945,43 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
+    private func removeFavoritePath(_ path: String) {
+        guard environmentTarget == "host", !isLoading, !savingFavorite, isRemovableFavoritePath(path),
+              let request = environmentRequest(operation: 12, path: path), let session = urlSession else { return }
+        savingFavorite = true
+        updateBreadcrumbBar()
+        Task {
+            defer { savingFavorite = false; updateBreadcrumbBar(); notifyAccessibilityLayoutChanged() }
+            do {
+                let (data, _) = try await session.data(for: request)
+                _ = try FilesEnvironment.envelope(data)
+                if environmentTarget == "host" { loadPlaces(); statusLayer.string = "Removed from Favorites" }
+            } catch { if environmentTarget == "host" { statusLayer.string = error.localizedDescription } }
+        }
+    }
+
+    private func toggleFavoritePath(_ path: String) {
+        if isRemovableFavoritePath(path) {
+            removeFavoritePath(path)
+        } else {
+            addFavoritePath(path)
+        }
+    }
+
+    private func favoriteButtonTitle(for path: String) -> String {
+        if isRemovableFavoritePath(path) { return "Remove from Favorites" }
+        return isFavoritePath(path) ? "In Favorites" : "Add to Favorites"
+    }
+
+    private func canToggleFavorite(_ path: String) -> Bool {
+        environmentTarget == "host" && !isLoading && !savingFavorite &&
+            (isRemovableFavoritePath(path) || !isFavoritePath(path))
+    }
+
     private func pathFromURL(_ urlString: String?) -> String? {
         guard let urlString,
               let components = URLComponents(string: urlString),
-              let path = components.queryItems?.first(where: { $0.name == "path" })?.value,
+              let path = components.formQueryItems?.first(where: { $0.name == "path" })?.value,
               !path.isEmpty else {
             return nil
         }
@@ -1924,11 +1994,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return nil
         }
 
-        var queryItems = components.queryItems ?? []
+        var queryItems = components.formQueryItems ?? []
         queryItems.removeAll { $0.name == "path" || $0.name == "target" }
         queryItems.append(URLQueryItem(name: "target", value: environmentTarget))
         queryItems.append(URLQueryItem(name: "path", value: path))
-        components.queryItems = queryItems
+        components.formQueryItems = queryItems
         return components.url
     }
 
@@ -2680,7 +2750,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
         if !addFavoriteFrame.isEmpty, addFavoriteFrame.contains(breadcrumbBarLayer.convert(point, from: rootLayer)) {
-            addFavoritePath(currentPath)
+            toggleFavoritePath(currentPath)
             return
         }
         if let favoritePath = favoritePath(at: point) {
@@ -3014,7 +3084,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         var components = URLComponents(url: downloadEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "path", value: entry.path)]
+        components?.formQueryItems = [URLQueryItem(name: "path", value: entry.path)]
         guard let downloadURL = components?.url else {
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: [])
             return
@@ -3083,6 +3153,24 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
+        if let path = favoritePath(at: point) {
+            let menuID = UUID()
+            pendingFavoriteMenuPaths[menuID] = path
+            outerframeHost.showContextMenu(menuID: menuID,
+                                           items: [
+                                            OuterframeContextMenuItem(id: "open-favorite",
+                                                                      title: "Open",
+                                                                      isEnabled: true,
+                                                                      systemImageName: "folder"),
+                                            OuterframeContextMenuItem(id: "remove-favorite",
+                                                                      title: "Remove from Favorites",
+                                                                      isEnabled: environmentTarget == "host" && !savingFavorite && isRemovableFavoritePath(path),
+                                                                      systemImageName: "star.slash")
+                                           ],
+                                           at: point)
+            return
+        }
+
         let index = rowIndex(at: point)
         if entries.indices.contains(index), entries[index].isDirectory {
             let entry = entries[index]
@@ -3099,10 +3187,11 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                                                                       title: "Open",
                                                                       isEnabled: true,
                                                                       systemImageName: "folder"),
-                                            OuterframeContextMenuItem(id: "add-to-favorites",
-                                                                      title: isFavoritePath(entry.path) ? "In Favorites" : "Add to Favorites",
-                                                                      isEnabled: environmentTarget == "host" && !savingFavorite && !isFavoritePath(entry.path),
-                                                                      systemImageName: "star"),
+                                            OuterframeContextMenuItem(id: "toggle-favorite",
+                                                                      title: favoriteButtonTitle(for: entry.path),
+                                                                      isEnabled: environmentTarget == "host" && !savingFavorite &&
+                                                                          (isRemovableFavoritePath(entry.path) || !isFavoritePath(entry.path)),
+                                                                      systemImageName: isRemovableFavoritePath(entry.path) ? "star.slash" : "star"),
                                             contextMenuSeparator(id: "directory-separator"),
                                             OuterframeContextMenuItem(id: "paste",
                                                                       title: "Paste",
@@ -3269,13 +3358,21 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
+        if let path = pendingFavoriteMenuPaths.removeValue(forKey: menuID) {
+            if itemID == "open-favorite" {
+                openDirectory(path: path)
+            } else if itemID == "remove-favorite" {
+                removeFavoritePath(path)
+            }
+            return
+        }
         guard let entry = pendingDirectoryMenuEntries.removeValue(forKey: menuID) else {
             return
         }
         if itemID == "open-directory" {
             openDirectory(path: entry.path)
-        } else if itemID == "add-to-favorites" {
-            addFavorite(entry)
+        } else if itemID == "toggle-favorite", entry.isDirectory {
+            toggleFavoritePath(entry.path)
         }
     }
 
@@ -3324,7 +3421,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         let target = environmentTarget
         let request: URLRequest
         if target != "host", var components = URLComponents(url: openersEndpoint, resolvingAgainstBaseURL: false) {
-            components.queryItems = [URLQueryItem(name: "path", value: entry.path), URLQueryItem(name: "contentType", value: "public.text")]
+            components.formQueryItems = [URLQueryItem(name: "path", value: entry.path), URLQueryItem(name: "contentType", value: "public.text")]
             guard let url = components.url else { completion(.failure("could not build request")); return }
             request = URLRequest(url: url)
         } else {
@@ -3512,10 +3609,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private func openerNavigationURL(_ opener: FileOpener) -> URL? {
         guard let url = baseOpenerNavigationURL(opener) else { return nil }
         guard opener.serviceID == "org.outershell.Plaintext", var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
-        var items = components.queryItems ?? []
+        var items = components.formQueryItems ?? []
         items.removeAll { $0.name == "target" }
         items.append(URLQueryItem(name: "target", value: environmentTarget))
-        components.queryItems = items
+        components.formQueryItems = items
         return components.url
     }
 
@@ -3594,6 +3691,10 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         return favoriteLocations.contains { $0.path == path }
     }
 
+    private func isRemovableFavoritePath(_ path: String) -> Bool {
+        favoriteLocations.contains { $0.path == path && $0.isRemovable }
+    }
+
     private func beginDraggingFilePromise(for entry: FileEntry, at index: Int) {
         dragStartedForSelectionIndex = index
         beginDraggingFilePromise(for: entry,
@@ -3652,7 +3753,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         var components = URLComponents(url: downloadEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "path", value: entry.path)]
+        components?.formQueryItems = [URLQueryItem(name: "path", value: entry.path)]
         guard let downloadURL = components?.url else {
             outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
                                                        promiseID: promiseID,
@@ -3844,7 +3945,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
     private nonisolated static func remoteFileDownloadURL(path: String,
                                                           downloadEndpoint: URL) throws -> URL {
         var components = URLComponents(url: downloadEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        components?.formQueryItems = [URLQueryItem(name: "path", value: path)]
         guard let url = components?.url else {
             throw NSError(domain: NSURLErrorDomain,
                           code: NSURLErrorBadURL,
@@ -4138,7 +4239,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
 
         var components = URLComponents(url: uploadEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
+        components?.formQueryItems = [
             URLQueryItem(name: "directory", value: remoteDirectory),
             URLQueryItem(name: "name", value: name)
         ]
@@ -4329,7 +4430,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         switch action {
         case .press, .focus:
             if node.value == "files:environment" { showEnvironmentMenu(at: CGPoint(x: node.frame.midX, y: node.frame.midY)); return }
-            if node.value == "files:add-favorite" { addFavoritePath(currentPath); return }
+            if node.value == "files:add-favorite" { toggleFavoritePath(currentPath); return }
             if node.role == .row, let path = node.value, let index = entries.firstIndex(where: { $0.path == path }) {
                 selectIndex(index)
             } else if node.role == .button, let path = node.value {
@@ -4432,7 +4533,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
         }
         if environmentTarget == "host" {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button,
-                frame: breadcrumbBarLayer.convert(addFavoriteFrame, to: rootLayer), label: isFavoritePath(currentPath) ? "In Favorites" : "Add to Favorites", value: "files:add-favorite", isEnabled: !isLoading && !savingFavorite && !isFavoritePath(currentPath)))
+                frame: breadcrumbBarLayer.convert(addFavoriteFrame, to: rootLayer), label: favoriteButtonTitle(for: currentPath), value: "files:add-favorite", isEnabled: canToggleFavorite(currentPath)))
         }
         for (index, segment) in segments.enumerated() where index < breadcrumbSegmentFrames.count {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,

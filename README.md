@@ -69,8 +69,10 @@ publishing should live outside this repository.
 
 In either the HTML or Outerframe app, on the host, use **Add to Favorites** beside the current folder path, or
 right-click a folder and choose **Add to Favorites**. Saved folders appear in
-the places bar immediately and persist across restarts. Existing favorites
-show **In Favorites** to prevent duplicates.
+the places bar immediately and persist across restarts. To remove one, open it
+and use **Remove from Favorites** in the same place, or right-click it in the
+places bar or in a folder listing. Home, mounted volumes, and entries from the
+shared list are always shown and read **In Favorites**.
 
 Personal favorites are stored as `path<TAB>label` rows in
 `$XDG_CONFIG_HOME/outer-files/places.tsv`, defaulting to

@@ -1,7 +1,7 @@
 const EnvironmentBinary = (() => {
     'use strict';
     const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', {fatal:true});
-    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, places:10, addPlace:11};
+    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, places:10, addPlace:11, removePlace:12};
     function encode(operation, values = {}) {
         const op = operations[operation];
         if (!op) throw Error('Unsupported environment operation');
