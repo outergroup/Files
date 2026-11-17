@@ -124,6 +124,8 @@ enum BrowserToContentMessage {
                                       modifierFlags: UInt64)
     case pasteboardAccessResponse(requestID: UUID, granted: Bool, items: [OuterframeContentPasteboardItem])
     case filePromiseWriteRequest(requestID: UUID, promiseID: UUID)
+    case hostSpecificMessage(name: String, payload: Data)
+    case hostSpecificMessageUnrecognized(name: String)
     case accessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String)
     case accessibilityActionAndSnapshot(requestID: UUID, identifier: UInt32, action: OuterframeAccessibilityAction, value: String)
     case accessibilityTextQuery(requestID: UUID, identifier: UInt32, query: OuterframeAccessibilityTextQuery, range: NSRange, point: CGPoint)
@@ -440,6 +442,17 @@ enum BrowserToContentMessage {
             payload.append(uuid: requestID)
             payload.append(uuid: promiseID)
             return makeBrowserToContentFrame(type: .filePromiseWriteRequest, payload: payload)
+
+        case .hostSpecificMessage(let name, let messagePayload):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: name)
+            try payload.append(dataReference: messagePayload)
+            return makeBrowserToContentFrame(type: .hostSpecificMessage, payload: try payload.finalize())
+
+        case .hostSpecificMessageUnrecognized(let name):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: name)
+            return makeBrowserToContentFrame(type: .hostSpecificMessageUnrecognized, payload: try payload.finalize())
 
         case .accessibilityAction(let identifier, let action, let value):
             var payload = OffsetPayloadBuilder()
@@ -902,6 +915,19 @@ enum BrowserToContentMessage {
             }
             return .filePromiseWriteRequest(requestID: requestID, promiseID: promiseID)
 
+        case .hostSpecificMessage:
+            guard let name = cursor.readStringReference(),
+                  let messagePayload = cursor.readDataReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .hostSpecificMessage(name: name, payload: messagePayload)
+
+        case .hostSpecificMessageUnrecognized:
+            guard let name = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .hostSpecificMessageUnrecognized(name: name)
+
         case .accessibilityAction:
             guard let identifier = cursor.readUInt32(),
                   let rawAction = cursor.readUInt8(),
@@ -1004,7 +1030,6 @@ enum ContentToBrowserMessage {
                                  pasteboardTypes: [String],
                                  items: [OuterframeContentPasteboardItem])
     case beginDraggingPasteboardItems(items: [OuterframeContentDraggingItem], operationMask: UInt32)
-    case releaseDroppedFileAccess(accessID: UUID)
     case filePromiseWriteResponse(requestID: UUID,
                                   promiseID: UUID,
                                   success: Bool,
@@ -1012,8 +1037,9 @@ enum ContentToBrowserMessage {
                                   deleteWhenDone: Bool,
                                   errorMessage: String?)
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
-    case navigate(url: String)
+    case navigate(url: String, displayString: String?)
     case openNewTab(url: String, displayString: String?)
+    case openURLExternally(url: String)
     case editCommandValidationResponse(requestID: UUID, enabledCommands: OuterframeEditCommandSet)
     case setPasteboardDropBehaviorUniform([String])
     case setAcceptedPasteboardPasteTypes([String])
@@ -1028,6 +1054,7 @@ enum ContentToBrowserMessage {
     case historyGo(delta: Int32)
     case setTitle(String?)
     case setIcon(OuterframePresentationIcon)
+    case hostSpecificMessage(name: String, payload: Data)
 
     func encode() throws -> Data {
         switch self {
@@ -1121,11 +1148,6 @@ enum ContentToBrowserMessage {
             try appendDraggingItems(items, to: &payload)
             return makeContentToBrowserFrame(type: .beginDraggingPasteboardItems, payload: try payload.finalize())
 
-        case .releaseDroppedFileAccess(let accessID):
-            var payload = Data(capacity: 16)
-            payload.append(uuid: accessID)
-            return makeContentToBrowserFrame(type: .releaseDroppedFileAccess, payload: payload)
-
         case .filePromiseWriteResponse(let requestID, let promiseID, let success, let localPath, let deleteWhenDone, let errorMessage):
             var payload = OffsetPayloadBuilder()
             payload.append(uuid: requestID)
@@ -1150,10 +1172,16 @@ enum ContentToBrowserMessage {
             payload.append(float64: preferredSize.map { Float64($0.height) } ?? 0)
             return makeContentToBrowserFrame(type: .openNewWindow, payload: try payload.finalize())
 
-        case .navigate(let url):
+        case .navigate(let url, let displayString):
             var payload = OffsetPayloadBuilder()
             try payload.append(stringReference: url)
-            return makeContentToBrowserFrame(type: .navigate, payload: try payload.finalize())
+            guard let displayString else {
+                return makeContentToBrowserFrame(type: .navigate,
+                                                 payload: try payload.finalize())
+            }
+            try payload.append(stringReference: displayString)
+            return makeContentToBrowserFrame(type: .navigateWithDisplayString,
+                                             payload: try payload.finalize())
 
         case .openNewTab(let url, let displayString):
             var payload = OffsetPayloadBuilder()
@@ -1163,6 +1191,11 @@ enum ContentToBrowserMessage {
             payload.append(uint8: flags)
             try payload.append(stringReference: displayString ?? "")
             return makeContentToBrowserFrame(type: .openNewTab, payload: try payload.finalize())
+
+        case .openURLExternally(let url):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: url)
+            return makeContentToBrowserFrame(type: .openURLExternally, payload: try payload.finalize())
 
         case .editCommandValidationResponse(let requestID, let enabledCommands):
             var payload = Data(capacity: 20)
@@ -1271,6 +1304,12 @@ enum ContentToBrowserMessage {
             payload.append(uint8: iconKind)
             try payload.append(stringReference: iconPath)
             return makeContentToBrowserFrame(type: .setIcon, payload: try payload.finalize())
+
+        case .hostSpecificMessage(let name, let messagePayload):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: name)
+            try payload.append(dataReference: messagePayload)
+            return makeContentToBrowserFrame(type: .hostSpecificMessage, payload: try payload.finalize())
         }
     }
 
@@ -1401,12 +1440,6 @@ enum ContentToBrowserMessage {
             }
             let items = try readDraggingItems(cursor: &cursor)
             return .beginDraggingPasteboardItems(items: items, operationMask: operationMask)
-
-        case .releaseDroppedFileAccess:
-            guard let accessID = cursor.readUUID() else {
-                throw OuterframeContentSocketMessageError.truncatedPayload
-            }
-            return .releaseDroppedFileAccess(accessID: accessID)
 
         case .filePromiseWriteResponse:
             guard let requestID = cursor.readUUID(),
@@ -1546,7 +1579,14 @@ enum ContentToBrowserMessage {
             guard let url = cursor.readStringReference() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            return .navigate(url: url)
+            return .navigate(url: url, displayString: nil)
+
+        case .navigateWithDisplayString:
+            guard let url = cursor.readStringReference(),
+                  let displayString = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .navigate(url: url, displayString: displayString)
 
         case .openNewTab:
             guard let url = cursor.readStringReference(),
@@ -1556,6 +1596,12 @@ enum ContentToBrowserMessage {
             }
             let displayString = flags & (1 << 0) != 0 ? displayStringReference : nil
             return .openNewTab(url: url, displayString: displayString)
+
+        case .openURLExternally:
+            guard let url = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .openURLExternally(url: url)
 
         case .setTitle:
             guard let flags = cursor.readUInt8(),
@@ -1582,6 +1628,13 @@ enum ContentToBrowserMessage {
                 icon = .none
             }
             return .setIcon(icon)
+
+        case .hostSpecificMessage:
+            guard let name = cursor.readStringReference(),
+                  let messagePayload = cursor.readDataReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .hostSpecificMessage(name: name, payload: messagePayload)
         }
     }
 }
@@ -1649,7 +1702,12 @@ public struct OuterframeEditCommandSet: OptionSet, Sendable {
     public static let cut = OuterframeEditCommandSet(rawValue: 1 << 1)
     public static let paste = OuterframeEditCommandSet(rawValue: 1 << 2)
     public static let selectAll = OuterframeEditCommandSet(rawValue: 1 << 3)
-    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll]
+    public static let find = OuterframeEditCommandSet(rawValue: 1 << 4)
+    public static let findNext = OuterframeEditCommandSet(rawValue: 1 << 5)
+    public static let findPrevious = OuterframeEditCommandSet(rawValue: 1 << 6)
+    public static let undo = OuterframeEditCommandSet(rawValue: 1 << 7)
+    public static let redo = OuterframeEditCommandSet(rawValue: 1 << 8)
+    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll, .find, .findNext, .findPrevious, .undo, .redo]
 }
 
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {
@@ -1792,9 +1850,6 @@ private enum BrowserToContentMessageKind: UInt16 {
     case setCursorPosition = 1025
     case selectionToPasteboardCopyRequest = 1026
     case pasteboardContentPasted = 1027
-    case accessibilityAction = 1043
-    case accessibilityActionAndSnapshot = 1045
-    case accessibilityTextQuery = 1044
     case accessibilitySnapshotRequest = 1028
     case historyEntryAccepted = 1029
     case historyEntryRejected = 1030
@@ -1807,6 +1862,11 @@ private enum BrowserToContentMessageKind: UInt16 {
     case pasteboardDropHitTestRequest = 1038
     case filePromiseWriteRequest = 1039
     case editCommandValidationRequest = 1040
+    case hostSpecificMessage = 1041
+    case hostSpecificMessageUnrecognized = 1042
+    case accessibilityAction = 1043
+    case accessibilityTextQuery = 1044
+    case accessibilityActionAndSnapshot = 1045
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1822,7 +1882,6 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case hapticFeedback = 2007
     case selectionToPasteboardResponse = 2008
     case editCommandValidationResponse = 2009
-    case accessibilityTextResponse = 2035
     case accessibilitySnapshotResponse = 2010
     case accessibilityTreeChanged = 2011
     case openNewWindow = 2012
@@ -1836,12 +1895,15 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case setAcceptedPasteboardPasteTypes = 2022
     case pasteboardDropHitTestResponse = 2023
     case setPasteboardDropBehaviorHitTest = 2024
-    case releaseDroppedFileAccess = 2026
     case filePromiseWriteResponse = 2027
     case navigate = 2028
     case openNewTab = 2029
     case setTitle = 2030
     case setIcon = 2031
+    case hostSpecificMessage = 2032
+    case navigateWithDisplayString = 2033
+    case openURLExternally = 2034
+    case accessibilityTextResponse = 2035
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }

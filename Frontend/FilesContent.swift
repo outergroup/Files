@@ -4191,7 +4191,6 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                     hadFailure = true
                     print("Files upload: failed to upload \(file.fileURL.path): \(error)")
                 }
-                self?.outerframeHost.releaseDroppedFileAccess(file.id)
             }
 
             guard let self else { return }

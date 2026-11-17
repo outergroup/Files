@@ -165,8 +165,10 @@ void environment_snapshot_free(EnvironmentSnapshot *snapshot) {
 
 static char *find_executable(const char *name) {
     const char *path = getenv("PATH");
-    char *dirs = format("%s:/opt/homebrew/bin:/usr/local/bin:%s/.local/bin", path ? path : "/usr/bin:/bin",
-                        getenv("HOME") ? getenv("HOME") : "");
+    const char *home = getenv("HOME") ? getenv("HOME") : "";
+    char *dirs = format("%s:/opt/homebrew/bin:/usr/local/bin:%s/.local/bin:%s/.docker/bin"
+                        ":/Applications/Docker.app/Contents/Resources/bin",
+                        path ? path : "/usr/bin:/bin", home, home);
     char *save = NULL, *result = NULL;
     for (char *dir = strtok_r(dirs, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
         char *candidate = format("%s/%s", dir, name);
