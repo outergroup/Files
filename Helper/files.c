@@ -177,104 +177,32 @@ static void read_places(const char *path, FileEntry **rows, size_t *count, bool 
     }
 }
 
-static BinaryReply add_place(const char *path) {
-    BinaryReply reply = {0};
-    char resolved[PATH_MAX], config[PATH_MAX];
-    struct stat st;
-    if (!realpath(path, resolved) || stat(resolved, &st)) {
-        fail("Cannot add favorite: %s", strerror(errno)); return reply;
-    }
-    if (!S_ISDIR(st.st_mode)) { fail("Only folders can be added to Favorites"); return reply; }
-    if (strpbrk(resolved, "\t\r\n")) { fail("Folder paths containing tabs or newlines cannot be saved as favorites"); return reply; }
-    if (!personal_places_path(config, true)) return reply;
-    int fd = open(config, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
-    if (fd < 0) { fail("Cannot open favorites: %s", strerror(errno)); return reply; }
-    if (flock(fd, LOCK_EX)) { fail("Cannot lock favorites: %s", strerror(errno)); close(fd); return reply; }
-    FILE *file = fdopen(fd, "r+");
-    if (!file) { fail("Cannot read favorites: %s", strerror(errno)); close(fd); return reply; }
-    char *line = NULL; size_t capacity = 0; bool found = false;
-    int last = '\n';
-    while (getline(&line, &capacity, file) >= 0) {
-        size_t length = strlen(line);
-        if (length) last = line[length - 1];
-        char *tab = strchr(line, '\t');
-        if (!tab) continue;
-        *tab = 0;
-        char existing[PATH_MAX];
-        if (!strcmp(line, resolved) || (realpath(line, existing) && !strcmp(existing, resolved))) found = true;
-    }
-    free(line);
-    if (ferror(file)) fail("Cannot read favorites: %s", strerror(errno));
-    if (!failure[0] && !found) {
-        const char *name = strrchr(resolved, '/');
-        name = name && name[1] ? name + 1 : resolved;
-        if (fseek(file, 0, SEEK_END) ||
-            fprintf(file, "%s%s\t%s\n", last == '\n' ? "" : "\n", resolved, name) < 0 ||
-            fflush(file) || fsync(fd)) fail("Cannot save favorite: %s", strerror(errno));
-    }
-    if (fclose(file)) fail("Cannot close favorites: %s", strerror(errno));
-    if (!failure[0]) {
-        reply = response_create(OP_ADD_PLACE, 0, 0);
-        binary_string(&reply.metadata, 48, resolved);
-    }
-    return reply;
+static bool place_hidden(char **hidden, size_t hidden_count, const char *path) {
+    for (size_t i = 0; i < hidden_count; i++)
+        if (!strcmp(hidden[i], path)) return true;
+    return false;
 }
 
-/* Removes every line of the personal favorites file that names `path`, directly or through a symbolic link. */
-static BinaryReply remove_place(const char *path) {
-    BinaryReply reply = {0};
-    char resolved[PATH_MAX], config[PATH_MAX];
-    if (!realpath(path, resolved)) snprintf(resolved, sizeof(resolved), "%s", path);
-    if (!personal_places_path(config, false)) return reply;
-    int fd = open(config, O_RDWR | O_NOFOLLOW);
-    if (fd < 0) {
-        if (errno == ENOENT) fail("This folder is not in your Favorites");
-        else fail("Cannot open favorites: %s", strerror(errno));
-        return reply;
+static void read_hidden_places(const char *path, char ***hidden, size_t *count) {
+    FILE *config = fopen(path, "r");
+    if (!config) return;
+    char *line = NULL; size_t capacity = 0;
+    while (getline(&line, &capacity, config) >= 0) {
+        line[strcspn(line, "\t\r\n")] = 0;
+        if (line[0] != '!' || line[1] != '/') continue;
+        char **next = realloc(*hidden, (*count + 1) * sizeof(**hidden));
+        if (!next) break;
+        *hidden = next;
+        if (((*hidden)[*count] = strdup(line + 1))) (*count)++;
     }
-    if (flock(fd, LOCK_EX)) { fail("Cannot lock favorites: %s", strerror(errno)); close(fd); return reply; }
-    FILE *file = fdopen(fd, "r+");
-    if (!file) { fail("Cannot read favorites: %s", strerror(errno)); close(fd); return reply; }
-    char *line = NULL, *kept = NULL; size_t capacity = 0, kept_length = 0; bool found = false;
-    ssize_t length;
-    while ((length = getline(&line, &capacity, file)) >= 0) {
-        char entry[PATH_MAX], existing[PATH_MAX];
-        size_t path_length = strcspn(line, "\t\r\n");
-        bool matches = false;
-        if (line[path_length] == '\t' && path_length < sizeof(entry)) {
-            memcpy(entry, line, path_length);
-            entry[path_length] = 0;
-            matches = !strcmp(entry, resolved) || !strcmp(entry, path) ||
-                (realpath(entry, existing) && !strcmp(existing, resolved));
-        }
-        if (matches) { found = true; continue; }
-        char *grown = realloc(kept, kept_length + (size_t)length + 1);
-        if (!grown) { fail("out of memory"); break; }
-        kept = grown;
-        memcpy(kept + kept_length, line, (size_t)length);
-        kept_length += (size_t)length;
-    }
-    free(line);
-    if (!failure[0] && ferror(file)) fail("Cannot read favorites: %s", strerror(errno));
-    if (!failure[0] && !found) fail("This folder is not in your Favorites");
-    if (!failure[0]) {
-        if (fseek(file, 0, SEEK_SET) || (kept_length && fwrite(kept, 1, kept_length, file) != kept_length) ||
-            fflush(file) || ftruncate(fd, (off_t)kept_length) || fsync(fd)) fail("Cannot save favorites: %s", strerror(errno));
-    }
-    free(kept);
-    if (fclose(file) && !failure[0]) fail("Cannot close favorites: %s", strerror(errno));
-    if (!failure[0]) {
-        reply = response_create(OP_REMOVE_PLACE, 0, 0);
-        binary_string(&reply.metadata, 48, resolved);
-    }
-    return reply;
+    free(line); fclose(config);
 }
 
-static BinaryReply list_places(void) {
-    FileEntry *rows = NULL;
-    size_t count = 0;
+/* Home, directory mounts, and the system places file, each marked "place" except Home. */
+static void builtin_places(FileEntry **rows, size_t *count) {
     char home[PATH_MAX];
-    if (expand_path("~", home)) place_add(&rows, &count, home, "Home", false);
+    if (expand_path("~", home)) place_add(rows, count, home, "Home", false);
+    size_t first = *count;
 #ifdef __linux__
     FILE *mounts = fopen("/proc/self/mountinfo", "r");
     if (mounts) {
@@ -288,14 +216,155 @@ static BinaryReply list_places(void) {
                 !strcmp(field, "/sys") || !strncmp(field, "/sys/", 5) ||
                 !strcmp(field, "/dev") || !strncmp(field, "/dev/", 5) ||
                 !strcmp(field, "/var/lib/outershell") || !strncmp(field, "/var/lib/outershell/", sizeof("/var/lib/outershell/") - 1)) continue;
-            place_add(&rows, &count, field, NULL, false);
+            place_add(rows, count, field, NULL, false);
         }
         free(line); fclose(mounts);
     }
 #endif
-    read_places("/etc/outer-files/places.tsv", &rows, &count, false);
+    read_places("/etc/outer-files/places.tsv", rows, count, false);
+    for (size_t i = first; i < *count; i++)
+        if (!(*rows)[i].mode[0]) strcpy((*rows)[i].mode, "place");
+}
+
+static void free_places(FileEntry *rows, size_t count) {
+    for (size_t i = 0; i < count; i++) { free(rows[i].name); free(rows[i].path); }
+    free(rows);
+}
+
+/* Returns true when `resolved` is a built-in place other than Home. */
+static bool is_hideable_builtin_place(const char *resolved) {
+    FileEntry *rows = NULL;
+    size_t count = 0;
+    bool found = false;
+    builtin_places(&rows, &count);
+    for (size_t i = 0; i < count && !found; i++)
+        found = !strcmp(rows[i].path, resolved) && !strcmp(rows[i].mode, "place");
+    free_places(rows, count);
+    return found;
+}
+
+/*
+ * Rewrites the personal places file without any favorite or hidden line naming `path`
+ * (directly or through a symbolic link), then appends `append` if it is not NULL.
+ * Sets `*had_favorite` when a favorite line was dropped.
+ */
+static bool rewrite_personal_places(const char *path, const char *resolved, const char *append, bool *had_favorite) {
+    char config[PATH_MAX];
+    *had_favorite = false;
+    if (!personal_places_path(config, true)) return false;
+    int fd = open(config, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (fd < 0) { fail("Cannot open favorites: %s", strerror(errno)); return false; }
+    if (flock(fd, LOCK_EX)) { fail("Cannot lock favorites: %s", strerror(errno)); close(fd); return false; }
+    FILE *file = fdopen(fd, "r+");
+    if (!file) { fail("Cannot read favorites: %s", strerror(errno)); close(fd); return false; }
+    char *line = NULL, *kept = NULL; size_t capacity = 0, kept_length = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, file)) >= 0) {
+        char entry[PATH_MAX], existing[PATH_MAX];
+        bool hidden = line[0] == '!';
+        const char *start = hidden ? line + 1 : line;
+        size_t path_length = strcspn(start, "\t\r\n");
+        bool matches = false;
+        if (*start == '/' && (hidden || start[path_length] == '\t') && path_length < sizeof(entry)) {
+            memcpy(entry, start, path_length);
+            entry[path_length] = 0;
+            matches = !strcmp(entry, resolved) || !strcmp(entry, path) ||
+                (realpath(entry, existing) && !strcmp(existing, resolved));
+        }
+        if (matches) { if (!hidden) *had_favorite = true; continue; }
+        if (length && line[length - 1] != '\n') line[length++] = '\n';
+        char *grown = realloc(kept, kept_length + (size_t)length + 1);
+        if (!grown) { fail("out of memory"); break; }
+        kept = grown;
+        memcpy(kept + kept_length, line, (size_t)length);
+        kept_length += (size_t)length;
+    }
+    free(line);
+    if (!failure[0] && ferror(file)) fail("Cannot read favorites: %s", strerror(errno));
+    if (!failure[0] && append) {
+        size_t append_length = strlen(append);
+        char *grown = realloc(kept, kept_length + append_length + 1);
+        if (!grown) fail("out of memory");
+        else {
+            kept = grown;
+            memcpy(kept + kept_length, append, append_length);
+            kept_length += append_length;
+        }
+    }
+    if (!failure[0]) {
+        if (fseek(file, 0, SEEK_SET) || (kept_length && fwrite(kept, 1, kept_length, file) != kept_length) ||
+            fflush(file) || ftruncate(fd, (off_t)kept_length) || fsync(fd)) fail("Cannot save favorites: %s", strerror(errno));
+    }
+    free(kept);
+    if (fclose(file) && !failure[0]) fail("Cannot close favorites: %s", strerror(errno));
+    return !failure[0];
+}
+
+static BinaryReply add_place(const char *path) {
+    BinaryReply reply = {0};
+    char resolved[PATH_MAX];
+    struct stat st;
+    if (!realpath(path, resolved) || stat(resolved, &st)) {
+        fail("Cannot add favorite: %s", strerror(errno)); return reply;
+    }
+    if (!S_ISDIR(st.st_mode)) { fail("Only folders can be added to Favorites"); return reply; }
+    if (strpbrk(resolved, "\t\r\n")) { fail("Folder paths containing tabs or newlines cannot be saved as favorites"); return reply; }
+    const char *name = strrchr(resolved, '/');
+    name = name && name[1] ? name + 1 : resolved;
+    char *line = NULL;
+    if (asprintf(&line, "%s\t%s\n", resolved, name) < 0) { fail("out of memory"); return reply; }
+    bool had_favorite;
+    bool saved = rewrite_personal_places(path, resolved, line, &had_favorite);
+    free(line);
+    if (saved) {
+        reply = response_create(OP_ADD_PLACE, 0, 0);
+        binary_string(&reply.metadata, 48, resolved);
+    }
+    return reply;
+}
+
+/* Drops the folder's favorite line and hides it if it is a built-in place such as a mount. */
+static BinaryReply remove_place(const char *path) {
+    BinaryReply reply = {0};
+    char resolved[PATH_MAX];
+    if (!realpath(path, resolved)) snprintf(resolved, sizeof(resolved), "%s", path);
+    if (strpbrk(resolved, "\r\n")) { fail("This folder is not in your Favorites"); return reply; }
+    bool builtin = is_hideable_builtin_place(resolved);
+    char *line = NULL;
+    if (builtin && asprintf(&line, "!%s\n", resolved) < 0) { fail("out of memory"); return reply; }
+    bool had_favorite;
+    bool saved = rewrite_personal_places(path, resolved, line, &had_favorite);
+    free(line);
+    if (saved && !had_favorite && !builtin) { fail("This folder is not in your Favorites"); return reply; }
+    if (saved) {
+        reply = response_create(OP_REMOVE_PLACE, 0, 0);
+        binary_string(&reply.metadata, 48, resolved);
+    }
+    return reply;
+}
+
+static BinaryReply list_places(void) {
+    FileEntry *rows = NULL;
+    size_t count = 0;
+    char **hidden = NULL;
+    size_t hidden_count = 0;
+    builtin_places(&rows, &count);
     char personal[PATH_MAX];
-    if (personal_places_path(personal, false)) read_places(personal, &rows, &count, true);
+    if (personal_places_path(personal, false)) {
+        read_hidden_places(personal, &hidden, &hidden_count);
+        read_places(personal, &rows, &count, true);
+    }
+    size_t shown = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!strcmp(rows[i].mode, "place") && place_hidden(hidden, hidden_count, rows[i].path)) {
+            free(rows[i].name); free(rows[i].path);
+            continue;
+        }
+        rows[shown++] = rows[i];
+    }
+    count = shown;
+    for (size_t i = 0; i < hidden_count; i++) free(hidden[i]);
+    free(hidden);
     BinaryReply reply = response_create(OP_PLACES, (uint32_t)count, FILE_ROW_SIZE);
     for (size_t i = 0; i < count; i++) {
         size_t offset = RESPONSE_SIZE + i * FILE_ROW_SIZE;
@@ -303,9 +372,8 @@ static BinaryReply list_places(void) {
         binary_string(&reply.metadata, offset + 8, rows[i].path);
         binary_string(&reply.metadata, offset + 16, rows[i].mode);
         put_u32(reply.metadata.data + offset + 24, 1);
-        free(rows[i].name); free(rows[i].path);
     }
-    free(rows);
+    free_places(rows, count);
     return reply;
 }
 

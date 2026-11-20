@@ -9,22 +9,42 @@ function filesFetch(input, options = {}) {
     return fetch(input, { ...options, headers });
 }
 
+const retriedEnvironmentOperations = new Set(['list','read','targets','preview','places']);
 async function environment(operation, values = {}, options = {}) {
- const response = await filesFetch('/api/environments', {...options, method:'POST',
-  headers:{'Content-Type':'application/octet-stream','X-Environment-Request':'1'},
-  body:EnvironmentBinary.encode(operation, {target:state.target, ...values})});
+ const body = EnvironmentBinary.encode(operation, {target:state.target, ...values});
+ let response;
+ for (let attempt = 0; ; attempt++) {
+  try {
+   response = await filesFetch('/api/environments', {...options, method:'POST',
+    headers:{'Content-Type':'application/octet-stream','X-Environment-Request':'1'}, body});
+   break;
+  } catch (e) {
+   if (!(e instanceof TypeError) || options.signal?.aborted || attempt >= 2 || !retriedEnvironmentOperations.has(operation)) throw e;
+   await new Promise(resolve => setTimeout(resolve, attempt ? 1200 : 400));
+  }
+ }
  if (!response.ok) throw Error(await response.text());
  return EnvironmentBinary.decode(await response.arrayBuffer(), operation);
+}
+const environmentErrorNotice={since:0,timer:0};
+function showEnvironmentError(message){
+ clearTimeout(environmentErrorNotice.timer);
+ if(!message){environmentErrorNotice.since=0;$('#environment-errors').textContent='';return}
+ if(!environmentErrorNotice.since)environmentErrorNotice.since=Date.now();
+ const wait=5000-(Date.now()-environmentErrorNotice.since);
+ if(wait<=0)$('#environment-errors').textContent=message;
+ else environmentErrorNotice.timer=setTimeout(()=>{if(!document.hidden)discoverEnvironments()},Math.min(wait,2500));
 }
 async function discoverEnvironments(){
  const select=$('#environment');select.disabled=true;
  try{const result=await environment('targets');select.replaceChildren(...result.targets.map(t=>{const o=document.createElement('option');o.value=t.id;const name=t.id==='host'?'Host':t.name;o.textContent=name+(t.state==='running'?'':` · ${t.state}`);o.dataset.name=name;o.disabled=t.state!=='running';return o}));
  if(!result.targets.some(t=>t.id===state.target)){const o=new Option('Unavailable container',state.target);select.append(o)}
- select.value=state.target;updateEnvironmentName();const showPicker=state.target!=='host'||result.targets.some(t=>t.id!=='host');$('.location-picker').hidden=!showPicker;$('.location-picker+.separator').hidden=!showPicker;$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');
- }catch(e){$('#environment-errors').textContent=e.message}finally{select.disabled=false}
+ select.value=state.target;updateEnvironmentName();const showPicker=state.target!=='host'||result.targets.some(t=>t.id!=='host');$('.location-picker').hidden=!showPicker;$('.location-picker+.separator').hidden=!showPicker;showEnvironmentError(result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · '));
+ }catch(e){showEnvironmentError(e.message)}finally{select.disabled=false}
 }
 function isFavorite(path){return state.placesTarget===state.target&&state.places.some(place=>place.path===path)}
-function isRemovableFavorite(path){return state.placesTarget===state.target&&state.places.some(place=>place.path===path&&place.mode==='favorite')}
+function isRemovablePlace(place){return place.mode==='favorite'||place.mode==='place'}
+function isRemovableFavorite(path){return state.placesTarget===state.target&&state.places.some(place=>place.path===path&&isRemovablePlace(place))}
 function updateFavoriteButton(){
  const button=$('#add-favorite'),saved=isFavorite(state.path),removable=isRemovableFavorite(state.path);
  button.hidden=state.target!=='host';button.disabled=!state.loaded||state.savingFavorite||(saved&&!removable);
@@ -46,10 +66,17 @@ async function addFavorite(path){
  catch(e){if(state.target===target)$('#status').textContent=e.message}
  finally{state.savingFavorite=false;updateFavoriteButton()}
 }
+const placePress={timer:0,fired:null};
+function addPlaceLongPress(button,place){
+ let startX=0,startY=0;const cancel=()=>{clearTimeout(placePress.timer);placePress.timer=0};
+ button.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse')return;cancel();placePress.fired=null;startX=e.clientX;startY=e.clientY;placePress.timer=setTimeout(()=>{placePress.timer=0;placePress.fired=button;showPlaceMenu(startX,startY+12,place)},500)});
+ button.addEventListener('pointermove',e=>{if(placePress.timer&&Math.hypot(e.clientX-startX,e.clientY-startY)>10)cancel()});
+ for(const name of ['pointerup','pointercancel','pointerleave'])button.addEventListener(name,cancel);
+}
 function renderPlaces(){
  updateFavoriteButton();
  const places=state.placesTarget===state.target?state.places:[{name:'Home',path:'~'}];
- $('#places').replaceChildren(...places.map(place=>{const button=document.createElement('button');button.textContent=place.name;button.title=place.path;button.className='place';button.classList.toggle('selected',place.path===state.path);if(place.path===state.path)button.setAttribute('aria-current','location');button.onclick=()=>load(place.path);button.oncontextmenu=e=>{e.preventDefault();showPlaceMenu(e.clientX,e.clientY,place)};return button}));
+ $('#places').replaceChildren(...places.map(place=>{const button=document.createElement('button');button.textContent=place.name;button.title=place.path;button.className='place';button.classList.toggle('selected',place.path===state.path);if(place.path===state.path)button.setAttribute('aria-current','location');button.onclick=()=>{if(placePress.fired===button){placePress.fired=null;return}load(place.path)};button.oncontextmenu=e=>{e.preventDefault();showPlaceMenu(e.clientX,e.clientY,place)};addPlaceLongPress(button,place);return button}));
 }
 async function loadPlaces(reportFailure=false){
  const target=state.target;renderPlaces();
@@ -58,7 +85,7 @@ async function loadPlaces(reportFailure=false){
 }
 function updateEnvironmentName(){const option=$('#environment').selectedOptions[0];$('#environment-name').textContent=option?.dataset.name||option?.textContent||(state.target==='host'?'Host':'Unavailable container')}
 function formQuery(values){return new URLSearchParams(values).toString().replace(/\+/g,'%20')}
-function updateLocation(){history.replaceState(null,'','?'+formQuery({path:state.path,target:state.target}).replace(/%2F/gi,'/'));updateEnvironmentName();document.title=$('#environment-name').textContent+' · Files'}
+function updateLocation(){history.replaceState(null,'','?'+formQuery({path:state.path,target:state.target}).replace(/%2F/gi,'/'));updateEnvironmentName();document.title=state.target==='host'?'Files':$('#environment-name').textContent+' · Files'}
 function switchEnvironment(){hideMenu();state.target=$('#environment').value;state.path='~';state.loaded=false;state.parent=null;state.homePath=null;state.entries=[];state.selected=null;updateLocation();render();loadPlaces();load('~')}
 async function downloadEntry(entry){try{if(state.target==='host'){location.href='/api/download?path='+encodeURIComponent(entry.path);return}const result=await environment('preview',{path:entry.path});const blob=new Blob([result.data],{type:result.type});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=entry.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){$('#status').textContent=e.message}}
 function parseFiles(b){const v=view(b);if(u32(v,0)!==0x534c4646)throw Error('Invalid file list');const count=u32(v,8),rowSize=u32(v,12),off=u32(v,16);return{path:str(b,v,32),parent:str(b,v,40),entries:Array.from({length:count},(_,i)=>{const o=off+i*rowSize;return{name:str(b,v,o),path:str(b,v,o+8),mode:str(b,v,o+16),directory:!!u32(v,o+24),access:u32(v,o+28),size:u64(v,o+32),modified:u64(v,o+40)}})}}

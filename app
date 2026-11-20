@@ -232,6 +232,7 @@ cmd_build_frontend() {
     install -m 0644 "${ROOT}/Resources/FilesWeb/app.js" "${STAGE_ROOT}/web/app.js"
     install -m 0644 "${ROOT}/Resources/FilesWeb/environment.js" "${STAGE_ROOT}/web/environment.js"
     install -m 0644 "${ROOT}/Resources/FilesWeb/folder-icon.png" "${STAGE_ROOT}/web/folder-icon.png"
+    install -m 0644 "${ROOT}/Resources/FilesWeb/app-icon.png" "${STAGE_ROOT}/web/app-icon.png"
     install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
 }
 
@@ -268,6 +269,7 @@ build_local_backend() {
     install -m 0644 "${STAGE_ROOT}/web/app.js" "${resources}/web/app.js"
     install -m 0644 "${STAGE_ROOT}/web/environment.js" "${resources}/web/environment.js"
     install -m 0644 "${STAGE_ROOT}/web/folder-icon.png" "${resources}/web/folder-icon.png"
+    install -m 0644 "${STAGE_ROOT}/web/app-icon.png" "${resources}/web/app-icon.png"
     install -m 0644 "${STAGE_ROOT}/app-icon.png" "${resources}/app-icon.png"
 
     local info_plist="${contents}/Info.plist"

@@ -71,12 +71,15 @@ In either the HTML or Outerframe app, on the host, use **Add to Favorites** besi
 right-click a folder and choose **Add to Favorites**. Saved folders appear in
 the places bar immediately and persist across restarts. To remove one, open it
 and use **Remove from Favorites** in the same place, or right-click it in the
-places bar or in a folder listing. Home, mounted volumes, and entries from the
-shared list are always shown and read **In Favorites**.
+places bar or in a folder listing. On touch screens, press and hold a place to
+open the same menu. Mounted volumes and entries from the shared list can be
+removed too, which hides them; adding one back shows it again. Home is always
+shown and reads **In Favorites**.
 
 Personal favorites are stored as `path<TAB>label` rows in
 `$XDG_CONFIG_HOME/outer-files/places.tsv`, defaulting to
-`~/.config/outer-files/places.tsv` for the backend's user. Shared entries in
+`~/.config/outer-files/places.tsv` for the backend's user. Hidden built-in places
+are stored in the same file as `!path` rows. Shared entries in
 `/etc/outer-files/places.tsv` are still loaded. Adding favorites in containers
 is not yet supported.
 

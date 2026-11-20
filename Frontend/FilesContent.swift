@@ -1921,7 +1921,7 @@ private final class FilesHandler: NSObject, OuterframeHostDelegate {
                 let result = try FilesEnvironment.list(data, operation: 10)
                 guard environmentTarget == target else { return }
                 favoriteLocations = result.entries.map {
-                    FavoriteLocation(title: $0.name, path: $0.path, isRemovable: $0.mode == "favorite")
+                    FavoriteLocation(title: $0.name, path: $0.path, isRemovable: $0.mode == "favorite" || $0.mode == "place")
                 }
                 updateFavoritesBar()
                 updateBreadcrumbBar()
